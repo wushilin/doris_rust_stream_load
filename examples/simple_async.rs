@@ -21,7 +21,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let mut headers = HeaderMap::new();
-    headers.insert("x-custom-header", HeaderValue::from_static("rust-example-async"));
+    headers.insert(
+        "x-custom-header",
+        HeaderValue::from_static("rust-example-async"),
+    );
 
     let cfg = Config::builder()
         .endpoint("http://doris.example.com")
@@ -31,7 +34,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .mode(Mode::Json)
         .validation(ValidationMode::Syntax)
         .fake_send(true)
-        .doris_upload_workers(25)
         .fake_send_delay(Duration::from_millis(50))
         .doris_upload_workers(2)
         .batch_bytes(20 * 1024 * 1024)

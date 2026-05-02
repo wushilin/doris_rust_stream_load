@@ -306,4 +306,3 @@ impl RequestQueue {
         (submissions, bytes)
     }
 }
-

@@ -442,6 +442,21 @@ impl Config {
         if self.label_prefix.trim().is_empty() {
             return Err(Error::InvalidConfig("label_prefix cannot be empty".into()));
         }
+        if self.csv_separator.as_bytes().len() != 1 {
+            return Err(Error::InvalidConfig(
+                "csv_separator must be exactly one byte".into(),
+            ));
+        }
+        if self.csv_quote.as_bytes().len() != 1 {
+            return Err(Error::InvalidConfig(
+                "csv_quote must be exactly one byte".into(),
+            ));
+        }
+        if self.csv_separator.as_bytes()[0] == self.csv_quote.as_bytes()[0] {
+            return Err(Error::InvalidConfig(
+                "csv_separator and csv_quote must be different".into(),
+            ));
+        }
         if self.fake_send_delay_set && self.fake_send_delay.as_nanos() > i64::MAX as u128 {
             return Err(Error::InvalidConfig("fake_send_delay is too large".into()));
         }

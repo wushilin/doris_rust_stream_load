@@ -415,7 +415,10 @@ pub(crate) fn is_redirect(status_code: u16) -> bool {
     matches!(status_code, 301 | 302 | 303 | 307 | 308)
 }
 
-pub(crate) fn resolve_redirect_url(current: &str, location: &str) -> Result<String, StreamLoadError> {
+pub(crate) fn resolve_redirect_url(
+    current: &str,
+    location: &str,
+) -> Result<String, StreamLoadError> {
     let location = location.trim();
     if Url::parse(location).is_ok() {
         return Ok(location.to_string());

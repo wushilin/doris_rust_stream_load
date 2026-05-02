@@ -1,4 +1,6 @@
-use doris_rust_stream_load::{AsyncClient, AsyncHandle, AuthenticationType, Config, LogLevel, Mode, ValidationMode};
+use doris_rust_stream_load::{
+    AsyncClient, AsyncHandle, AuthenticationType, Config, LogLevel, Mode, ValidationMode,
+};
 use reqwest::header::{HeaderMap, HeaderValue};
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver};

@@ -135,6 +135,18 @@ fn csv_validation_rejects_malformed_and_multirow_record() {
 }
 
 #[test]
+fn csv_validation_uses_configured_separator_and_quote() {
+    let mut cfg = fake_cfg(Mode::Csv, ValidationMode::Syntax);
+    cfg.csv_separator = "|".to_string();
+    cfg.csv_quote = "'".to_string();
+    let client = Client::new(cfg).expect("client should build");
+
+    assert!(client.send("1|'alice|bob'".to_string()).is_ok());
+    assert!(client.send("1,alice".to_string()).is_err());
+    client.close().expect("close should succeed");
+}
+
+#[test]
 fn json_validation_modes_match_go_semantics() {
     let syntax_client =
         Client::new(fake_cfg(Mode::Json, ValidationMode::Syntax)).expect("client should build");
@@ -188,6 +200,28 @@ fn callback_runs_once_per_submitted_batch() {
 
     assert!(handle.wait().success());
     assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+    client.close().expect("close should succeed");
+}
+
+#[test]
+fn callback_panic_does_not_kill_worker() {
+    let client =
+        Client::new(fake_cfg(Mode::Csv, ValidationMode::Syntax)).expect("client should build");
+
+    let panicking = client
+        .send_with_callback(
+            |_| {
+                panic!("callback should be contained");
+            },
+            "1,alice".to_string(),
+        )
+        .expect("send should succeed");
+    assert!(panicking.wait().success());
+
+    let after_panic = client
+        .send("2,bob".to_string())
+        .expect("worker should still accept later work");
+    assert!(after_panic.wait().success());
     client.close().expect("close should succeed");
 }
 

@@ -2,13 +2,15 @@ use crate::config::{AuthenticationType, Config, LogLevel, Mode, ValidationMode};
 use crate::errors::{Error, Result};
 use crate::queue::{generate_label, DeliveryBatch, QueueItem, QueuedSubmission};
 use crate::sender::{
-    classify_response_error, classify_transport_error, is_http_success, is_redirect,
-    load_ca_certs, resolve_redirect_url, LoadStateResponse, SendOutcome, StreamLoadError,
+    classify_response_error, classify_transport_error, is_http_success, is_redirect, load_ca_certs,
+    resolve_redirect_url, LoadStateResponse, SendOutcome, StreamLoadError,
 };
 use crate::types::{
     ClientStats, CompletionSink, DeliveryCallback, DeliveryResult, StreamLoadResponse,
 };
 use reqwest::header::{CONTENT_LENGTH, LOCATION};
+use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
     Arc, Mutex,
@@ -25,7 +27,13 @@ pub(crate) struct AsyncBatchCompletion {
 
 impl CompletionSink for AsyncBatchCompletion {
     fn complete(&self, result: DeliveryResult) {
-        let _ = self.tx.send(Some(result));
+        let _ = self.tx.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(result);
+            true
+        });
     }
 }
 
@@ -149,16 +157,15 @@ impl AsyncHttpSender {
         let mut redirect_count = 0u32;
 
         let response = loop {
-            let builder = self
-                .apply_stream_load_headers(
-                    self.client
-                        .put(&url)
-                        .body(body_bytes.clone())
-                        .timeout(timeout),
-                    batch,
-                    body_bytes.len(),
-                    redirect_count <= 1,
-                );
+            let builder = self.apply_stream_load_headers(
+                self.client
+                    .put(&url)
+                    .body(body_bytes.clone())
+                    .timeout(timeout),
+                batch,
+                body_bytes.len(),
+                redirect_count <= 1,
+            );
             let response = builder.send().await.map_err(classify_transport_error)?;
 
             if !is_redirect(response.status().as_u16()) {
@@ -370,7 +377,7 @@ struct AsyncStatsCollector {
     total_records_sent: AtomicI64,
     total_upload_attempts: AtomicI64,
     total_load_time_nanos: AtomicI64,
-    durations: Mutex<Vec<Duration>>,
+    durations: Mutex<VecDeque<Duration>>,
 }
 
 impl AsyncStatsCollector {
@@ -385,7 +392,7 @@ impl AsyncStatsCollector {
             total_records_sent: AtomicI64::new(0),
             total_upload_attempts: AtomicI64::new(0),
             total_load_time_nanos: AtomicI64::new(0),
-            durations: Mutex::new(Vec::new()),
+            durations: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -407,7 +414,11 @@ impl AsyncStatsCollector {
         if let Ok(d) = result.finished_at.duration_since(result.started_at) {
             self.total_load_time_nanos
                 .fetch_add(d.as_nanos() as i64, Ordering::SeqCst);
-            self.durations.lock().unwrap().push(d);
+            let mut durations = self.durations.lock().unwrap();
+            if durations.len() == crate::client::MAX_STATS_SAMPLES {
+                durations.pop_front();
+            }
+            durations.push_back(d);
         }
     }
 
@@ -441,7 +452,7 @@ impl AsyncStatsCollector {
         } else {
             Duration::ZERO
         };
-        let mut durations = self.durations.lock().unwrap().clone();
+        let mut durations: Vec<_> = self.durations.lock().unwrap().iter().copied().collect();
         durations.sort();
         let p50 = crate::client::percentile_duration(&durations, 0.50);
         let p90 = crate::client::percentile_duration(&durations, 0.90);
@@ -486,8 +497,6 @@ impl AsyncStatsCollector {
 pub struct AsyncClient {
     cfg: Config,
     intake_tx: Mutex<Option<mpsc::Sender<QueuedSubmission>>>,
-    // Owned here so close() and drop() can drain or abort workers directly.
-    dispatch_tx: Mutex<Option<mpsc::Sender<DeliveryBatch>>>,
     stats: Arc<AsyncStatsCollector>,
     closed: AtomicBool,
     batcher_handle: Mutex<Option<JoinHandle<()>>>,
@@ -529,17 +538,15 @@ impl AsyncClient {
             worker_handles.push(tokio::spawn(run_async_worker(rx, s, st, c)));
         }
 
-        // The batcher gets a clone of dispatch_tx; it drops that clone when it
-        // exits, but workers stay open until AsyncClient drops its own copy.
         let batcher_handle = tokio::spawn(run_async_batcher(
             intake_rx,
-            dispatch_tx.clone(),
+            dispatch_tx,
+            stats.clone(),
             cfg.clone(),
         ));
         Ok(Self {
             cfg,
             intake_tx: Mutex::new(Some(intake_tx)),
-            dispatch_tx: Mutex::new(Some(dispatch_tx)),
             stats,
             closed: AtomicBool::new(false),
             batcher_handle: Mutex::new(Some(batcher_handle)),
@@ -612,21 +619,22 @@ impl AsyncClient {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+
         // Signal batcher to stop accepting new submissions.
         let _ = self.intake_tx.lock().unwrap().take();
+
         // Wait for the batcher to flush all queued batches and exit.
-        if let Some(h) = self.batcher_handle.lock().unwrap().take() {
+        let batcher_handle = self.batcher_handle.lock().unwrap().take();
+        if let Some(h) = batcher_handle {
             h.await
                 .map_err(|_| Error::Internal("batcher task panicked".into()))?;
         }
-        // Batcher has exited and dropped its dispatch_tx clone. Drop ours too
-        // so workers see the channel closed and stop after finishing their
-        // current batch.
-        let _ = self.dispatch_tx.lock().unwrap().take();
+
         // Wait for all workers to drain.
         let handles = std::mem::take(&mut *self.worker_handles.lock().unwrap());
         for h in handles {
-            let _ = h.await;
+            h.await
+                .map_err(|_| Error::Internal("worker task panicked".into()))?;
         }
         Ok(())
     }
@@ -713,8 +721,13 @@ impl AsyncClient {
         match self.cfg.mode {
             Mode::Csv => {
                 if self.cfg.validation != ValidationMode::None {
-                    crate::client::validate_csv_records(records, self.cfg.columns.len())
-                        .map_err(|e| e.to_string())?;
+                    crate::client::validate_csv_records(
+                        records,
+                        self.cfg.columns.len(),
+                        self.cfg.csv_separator.as_bytes()[0],
+                        self.cfg.csv_quote.as_bytes()[0],
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
             }
             Mode::Json => {
@@ -739,16 +752,12 @@ impl Drop for AsyncClient {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Drop both channel senders to signal shutdown: the batcher sees
-        // intake_rx close and flushes, then drops its dispatch_tx clone;
-        // workers see dispatch_rx close and exit after finishing their
-        // current batch.  JoinHandles are dropped (detached), not aborted,
-        // so tasks run to completion on the runtime — every handle will
-        // eventually resolve, even if that means waiting out upload/poll
-        // timeouts on a dead backend.  The runtime must outlive the tasks;
-        // if it is dropped first, all pending tasks are cancelled by Tokio.
+        // Drop intake to signal shutdown. The batcher owns the only dispatch
+        // sender, so workers see dispatch EOF after the batcher drains and
+        // exits. JoinHandles are dropped (detached), not aborted, so tasks run
+        // to completion on the runtime. The runtime must outlive the tasks; if
+        // it is dropped first, all pending tasks are cancelled by Tokio.
         let _ = self.intake_tx.lock().map(|mut g| g.take());
-        let _ = self.dispatch_tx.lock().map(|mut g| g.take());
         // batcher_handle and worker_handles are dropped (detached) here.
     }
 }
@@ -758,6 +767,7 @@ impl Drop for AsyncClient {
 async fn run_async_batcher(
     mut intake_rx: mpsc::Receiver<QueuedSubmission>,
     dispatch_tx: mpsc::Sender<DeliveryBatch>,
+    stats: Arc<AsyncStatsCollector>,
     cfg: Config,
 ) {
     let mut current: Option<DeliveryBatch> = None;
@@ -776,7 +786,7 @@ async fn run_async_batcher(
             },
             _ = &mut sleep, if linger_armed => {
                 if let Some(batch) = current.take() {
-                    dispatch_tx.send(batch).await.ok();
+                    send_or_complete_batch(batch, &dispatch_tx, &stats, &cfg).await;
                 }
                 linger_armed = false;
                 continue;
@@ -789,7 +799,7 @@ async fn run_async_batcher(
                 && cfg.batch_bytes > 0
                 && batch.byte_size + submission.append_byte_size > cfg.batch_bytes
             {
-                dispatch_tx.send(current.take().unwrap()).await.ok();
+                send_or_complete_batch(current.take().unwrap(), &dispatch_tx, &stats, &cfg).await;
                 linger_armed = false;
             }
         }
@@ -800,21 +810,48 @@ async fn run_async_batcher(
 
         // Arm linger once when the first item lands in a fresh batch.
         if was_empty {
-            sleep.as_mut().reset(tokio::time::Instant::now() + cfg.linger);
+            sleep
+                .as_mut()
+                .reset(tokio::time::Instant::now() + cfg.linger);
             linger_armed = true;
         }
 
         if cfg.batch_bytes > 0 && batch.byte_size >= cfg.batch_bytes {
-            dispatch_tx.send(current.take().unwrap()).await.ok();
+            send_or_complete_batch(current.take().unwrap(), &dispatch_tx, &stats, &cfg).await;
             linger_armed = false;
         }
     }
 
     // Intake channel closed: flush whatever remains, then return.
-    // Dropping dispatch_tx here (along with AsyncClient's copy in close())
-    // signals workers that no more batches are coming.
+    // Intake channel closed: flush whatever remains, then return. Dropping
+    // dispatch_tx here signals workers that no more batches are coming.
     if let Some(batch) = current.take() {
-        dispatch_tx.send(batch).await.ok();
+        send_or_complete_batch(batch, &dispatch_tx, &stats, &cfg).await;
+    }
+}
+
+async fn send_or_complete_batch(
+    batch: DeliveryBatch,
+    dispatch_tx: &mpsc::Sender<DeliveryBatch>,
+    stats: &Arc<AsyncStatsCollector>,
+    cfg: &Config,
+) {
+    if let Err(err) = dispatch_tx.send(batch).await {
+        complete_async_batch(
+            err.0,
+            stats,
+            DeliveryResult {
+                err: Some(Error::Internal(
+                    "dispatch channel closed before batch delivery".into(),
+                )),
+                attempts: 0,
+                status_code: 0,
+                response: None,
+                started_at: SystemTime::now(),
+                finished_at: SystemTime::now(),
+            },
+            cfg,
+        );
     }
 }
 
@@ -881,10 +918,7 @@ async fn deliver_batch_async(
         attempts += 1;
         stats.record_upload_attempt(batch.byte_size as i64, batch.len() as i64);
 
-        match sender
-            .send(&batch, cfg.doris_upload_request_timeout)
-            .await
-        {
+        match sender.send(&batch, cfg.doris_upload_request_timeout).await {
             Ok(outcome) => {
                 complete_async_batch(
                     batch,
@@ -1008,9 +1042,7 @@ async fn poll_label_async(
                 "UNKNOWN" => {
                     return Err(StreamLoadError::Error {
                         status_code: state.status_code,
-                        message: format!(
-                            "load label {label} not found in Doris (state=UNKNOWN)"
-                        ),
+                        message: format!("load label {label} not found in Doris (state=UNKNOWN)"),
                         retriable: true,
                         ambiguous: false,
                         response: None,
@@ -1058,7 +1090,9 @@ fn complete_async_batch(
     for submission in batch.submissions {
         if let Some(callback) = submission.callback {
             let t = Instant::now();
-            callback(result.clone());
+            if catch_unwind(AssertUnwindSafe(|| callback(result.clone()))).is_err() {
+                cfg.log(LogLevel::Error, "delivery callback panicked");
+            }
             let elapsed = t.elapsed();
             if elapsed > cfg.slow_callback_warn {
                 cfg.log(LogLevel::Info, &format!("callback took {elapsed:?}"));
@@ -1080,5 +1114,9 @@ fn retry_backoff_delay(attempt: usize) -> Duration {
 
 fn next_backoff(current: Duration, max: Duration) -> Duration {
     let next = current.saturating_mul(2);
-    if next > max { max } else { next }
+    if next > max {
+        max
+    } else {
+        next
+    }
 }

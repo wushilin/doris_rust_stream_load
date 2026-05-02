@@ -8,8 +8,10 @@ use serde::de::{
     DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, Visitor,
 };
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -17,10 +19,11 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+pub(crate) const MAX_STATS_SAMPLES: usize = 1_000;
+
 pub struct Client {
     cfg: Config,
     intake: Arc<RequestQueue>,
-    dispatch: Mutex<Option<ChannelSender<DeliveryBatch>>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
     batcher_handle: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<ClientStatsCollector>,
@@ -37,7 +40,7 @@ struct ClientStatsCollector {
     total_records_sent: std::sync::atomic::AtomicI64,
     total_upload_attempts: std::sync::atomic::AtomicI64,
     total_load_time_nanos: std::sync::atomic::AtomicI64,
-    durations: Mutex<Vec<Duration>>,
+    durations: Mutex<VecDeque<Duration>>,
 }
 
 impl Client {
@@ -71,11 +74,10 @@ impl Client {
         let sender_clone = sender.clone();
         let stats_clone = stats.clone();
         let cfg_clone = cfg.clone();
-        let batcher_tx = dispatch_tx.clone();
         let batcher = thread::spawn(move || {
             run_batcher(
                 intake_clone,
-                batcher_tx,
+                dispatch_tx,
                 sender_clone,
                 stats_clone,
                 cfg_clone,
@@ -85,7 +87,6 @@ impl Client {
         Ok(Self {
             cfg,
             intake,
-            dispatch: Mutex::new(Some(dispatch_tx)),
             worker_handles: Mutex::new(worker_handles),
             batcher_handle: Mutex::new(Some(batcher)),
             stats,
@@ -151,15 +152,15 @@ impl Client {
         if self.closed.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
+
         self.intake.close();
 
-        if let Some(handle) = self.batcher_handle.lock().unwrap().take() {
+        let batcher_handle = self.batcher_handle.lock().unwrap().take();
+        if let Some(handle) = batcher_handle {
             handle
                 .join()
                 .map_err(|_| Error::Internal("batcher thread panicked".into()))?;
         }
-
-        self.dispatch.lock().unwrap().take();
 
         let worker_handles = std::mem::take(&mut *self.worker_handles.lock().unwrap());
         for handle in worker_handles {
@@ -238,8 +239,13 @@ impl Client {
         match self.cfg.mode {
             Mode::Csv => {
                 if self.cfg.validation != ValidationMode::None {
-                    validate_csv_records(records, self.cfg.columns.len())
-                        .map_err(|e| e.to_string())?;
+                    validate_csv_records(
+                        records,
+                        self.cfg.columns.len(),
+                        self.cfg.csv_separator.as_bytes()[0],
+                        self.cfg.csv_quote.as_bytes()[0],
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
             }
             Mode::Json => {
@@ -262,10 +268,14 @@ impl Client {
 pub(crate) fn validate_csv_records(
     records: &[String],
     expected_columns: usize,
+    delimiter: u8,
+    quote: u8,
 ) -> std::result::Result<(), csv::Error> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(false)
+        .delimiter(delimiter)
+        .quote(quote)
         .from_reader(CsvRecordsReader::new(records));
     let mut count = 0;
     for result in reader.records() {
@@ -353,7 +363,11 @@ fn invalid_csv(message: impl Into<String>) -> csv::Error {
     ))
 }
 
-pub(crate) fn validate_json_record(record: &str, columns: &[String], strict: bool) -> serde_json::Result<()> {
+pub(crate) fn validate_json_record(
+    record: &str,
+    columns: &[String],
+    strict: bool,
+) -> serde_json::Result<()> {
     if strict {
         return JSON_STRICT_VALIDATOR
             .with(|validator| validator.borrow_mut().validate(record, columns));
@@ -491,14 +505,30 @@ fn run_batcher(
     intake: Arc<RequestQueue>,
     dispatch: ChannelSender<DeliveryBatch>,
     _sender: Arc<dyn Sender>,
-    _stats: Arc<ClientStatsCollector>,
+    stats: Arc<ClientStatsCollector>,
     cfg: Config,
 ) {
     let mut current: Option<DeliveryBatch> = None;
 
     let flush = |batch: &mut Option<DeliveryBatch>| {
         if let Some(batch) = batch.take() {
-            let _ = dispatch.send(batch);
+            if let Err(err) = dispatch.send(batch) {
+                complete_batch(
+                    err.0,
+                    stats.clone(),
+                    DeliveryResult {
+                        err: Some(Error::Internal(
+                            "dispatch channel closed before batch delivery".into(),
+                        )),
+                        attempts: 0,
+                        status_code: 0,
+                        response: None,
+                        started_at: SystemTime::now(),
+                        finished_at: SystemTime::now(),
+                    },
+                    &cfg,
+                );
+            }
         }
     };
 
@@ -815,7 +845,9 @@ fn complete_batch(
     for submission in batch.submissions {
         if let Some(callback) = submission.callback {
             let started = Instant::now();
-            callback(result.clone());
+            if catch_unwind(AssertUnwindSafe(|| callback(result.clone()))).is_err() {
+                cfg.log(LogLevel::Error, "delivery callback panicked");
+            }
             let elapsed = started.elapsed();
             if elapsed > cfg.slow_callback_warn {
                 cfg.log(LogLevel::Info, &format!("callback took {:?}", elapsed));
@@ -865,7 +897,7 @@ impl ClientStatsCollector {
             total_records_sent: std::sync::atomic::AtomicI64::new(0),
             total_upload_attempts: std::sync::atomic::AtomicI64::new(0),
             total_load_time_nanos: std::sync::atomic::AtomicI64::new(0),
-            durations: Mutex::new(Vec::new()),
+            durations: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -892,7 +924,10 @@ impl ClientStatsCollector {
             self.total_load_time_nanos
                 .fetch_add(duration.as_nanos() as i64, Ordering::SeqCst);
             let mut durations = self.durations.lock().unwrap();
-            durations.push(duration);
+            if durations.len() == MAX_STATS_SAMPLES {
+                durations.pop_front();
+            }
+            durations.push_back(duration);
         }
     }
 
@@ -926,7 +961,7 @@ impl ClientStatsCollector {
         } else {
             Duration::ZERO
         };
-        let mut durations = self.durations.lock().unwrap().clone();
+        let mut durations: Vec<_> = self.durations.lock().unwrap().iter().copied().collect();
         durations.sort();
         let p50 = percentile_duration(&durations, 0.50);
         let p90 = percentile_duration(&durations, 0.90);

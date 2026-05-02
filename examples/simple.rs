@@ -24,7 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .mode(Mode::Json)
         .validation(ValidationMode::Syntax)
         .fake_send(true)
-        .doris_upload_workers(25)
         .fake_send_delay(Duration::from_millis(50))
         .doris_upload_workers(2)
         .batch_bytes(20 * 1024 * 1024)

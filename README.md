@@ -14,7 +14,7 @@ Two client variants are provided:
 ## Features
 
 - Bounded request queue with optional enqueue timeout
-- Batch assembly by record count and configurable `batch_bytes`
+- Batch assembly by configurable `batch_bytes` and `linger`
 - CSV and JSON payload support
 - CSV syntax validation and optional JSON strict validation
 - Concurrent upload workers with configurable worker count
@@ -49,6 +49,7 @@ let client = Client::new(cfg)?;
 let handle = client.send("1,alice".to_string())?;
 let result = handle.wait();
 assert!(result.success());
+client.close()?;
 ```
 
 ---
@@ -160,12 +161,12 @@ if handle.is_done() {
 
 Records are coalesced into batches before upload. Two parameters control when a batch is flushed:
 
-- `batch_bytes` — flush as soon as accumulated bytes reach this threshold. 4–20 MB is a common range.
-- `linger` — flush after this duration even if `batch_bytes` has not been reached. 50–200 ms balances latency and throughput.
+- `batch_bytes` — flush as soon as accumulated bytes reach this threshold. The default is 90 MB (the Doris hard cap). For lower latency or smaller Doris instances, 4–20 MB is a common tuning range.
+- `linger` — flush after this duration even if `batch_bytes` has not been reached. The default is 5 ms. Increase to 50–200 ms to trade latency for larger, more efficient batches.
 
 ```rust
-.batch_bytes(8 * 1024 * 1024)   // 8 MB
-.linger(Duration::from_millis(100))
+.batch_bytes(8 * 1024 * 1024)   // 8 MB — lower than default for smaller clusters
+.linger(Duration::from_millis(100))  // 100 ms — higher than default for throughput
 ```
 
 ### Queue sizing
@@ -185,7 +186,12 @@ Records are coalesced into batches before upload. Two parameters control when a 
 
 ### Callback vs handle
 
-`send_with_callback` fires a closure on the Tokio worker thread that completes the batch. Use it when you want fire-and-forget accounting (increment counters, write to a channel) without holding an `AsyncHandle`. Use `handle.wait().await` when you need the result to drive further logic in the same async task.
+`send_with_callback` registers a closure that fires once the batch containing the record is uploaded. Use it when you want fire-and-forget accounting (increment counters, send to a channel) without retaining a handle. Use `handle.wait()` / `handle.wait().await` when you need the result to drive further logic.
+
+- **`AsyncClient`** — the callback runs on the Tokio worker task that completes the batch.
+- **`Client`** — the callback runs on the OS worker thread that completes the batch.
+
+In both cases, callbacks should be short and non-blocking. If a callback panics, the client catches the panic with `catch_unwind`, logs an error, and keeps the worker alive. The associated handle is guaranteed to be completed before any callback runs.
 
 ---
 
@@ -202,9 +208,11 @@ client.close()?;         // Client
 
 - Signals the batcher to stop accepting new submissions.
 - Waits for the batcher to flush all queued records into batches.
-- Waits for all upload workers to finish their current batch.
+- The batcher drops its dispatched-work sender when it exits.
+- Waits for all upload workers to see dispatched-work EOF and exit.
 - Returns only after every enqueued record has been delivered (or failed with an error).
 - Every `handle.wait()` / `handle.wait().await` that was issued before `close()` is guaranteed to have resolved by the time `close()` returns.
+- Calling `close()` more than once is safe; later calls return immediately.
 - Preferred for production code where you need a clean handoff.
 
 ### `drop()` without `close()` — fire-and-forget shutdown
@@ -450,6 +458,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 | `log_level(LogLevel)` | `Info` | Minimum level to emit: `Error`, `Info`, or `Debug` |
 | `tls_skip_verify(bool)` | `false` | Disable TLS certificate verification |
 | `tls_ca_cert_path(p)` | none | Custom CA certificate bundle (PEM) |
+
+`csv_separator` and `csv_quote` must each be exactly one byte, and they must be different. The same values are used for local CSV validation and the Doris stream load headers.
+
+`ClientStats` keeps all-time counters and averages, while percentile fields (`p50`, `p90`, `p99`, `p999`) are calculated from the most recent 1,000 completed load jobs to keep memory and `stats()` calls bounded.
 
 ---
 
