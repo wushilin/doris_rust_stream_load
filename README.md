@@ -421,33 +421,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 | Method | Default | Description |
 |---|---|---|
-| `endpoint(url)` | — | Base URL of the Doris FE, e.g. `http://host:8030` |
-| `database(db)` | — | Target database |
-| `table(t)` | — | Target table |
-| `stream_load_url(url)` | derived | Override the full stream load URL |
-| `with_columns(iter)` | — | Column list, e.g. `["id", "name"]` |
-| `headers(map)` | — | Extra HTTP headers forwarded to every request |
+| `endpoint(url)` | required | Base URL of the Doris FE, e.g. `http://host:8030` |
+| `database(db)` | required | Target database |
+| `table(t)` | required | Target table |
+| `stream_load_url(url)` | derived | Override the full stream load URL (makes `endpoint`, `database`, `table` optional) |
+| `with_columns(iter)` | required | Column list, e.g. `["id", "name"]` |
+| `headers(map)` | none | Extra HTTP headers forwarded to every request |
 | `mode(Mode)` | `Csv` | `Mode::Csv` or `Mode::Json` |
-| `validation(ValidationMode)` | `None` | `None`, `Syntax`, or `Strict` |
-| `authentication_type(t)` | `None` | `AuthenticationType::Basic` |
-| `authentication_token(s)` | — | `"user:password"` for basic auth |
-| `max_queue_size(n)` | 100 000 | Max pending submissions in intake queue |
-| `max_upload_queue_size(n)` | 4 | Dispatch queue depth between batcher and workers |
-| `batch_bytes(n)` | 10 MB | Flush batch when accumulated bytes reach this threshold |
-| `linger(d)` | 100 ms | Flush batch after this duration even if not full |
-| `max_queue_wait_time(d)` | 0 (no wait) | How long `send()` blocks when the queue is full before returning `QueueFull` |
-| `doris_upload_workers(n)` | 2 | Concurrent HTTP upload workers |
-| `doris_upload_timeout(d)` | 300 s | Total timeout for a batch including retries |
-| `doris_upload_request_timeout(d)` | 60 s | Per-request HTTP timeout |
-| `status_poll_timeout(d)` | 30 s | Timeout for label state polling on ambiguous responses |
-| `label_prefix(s)` | `""` | Prefix for generated stream load labels |
-| `fake_send(bool)` | `false` | Skip real HTTP; return a synthetic success |
-| `fake_send_delay(d)` | 0 | Simulated latency in fake send mode |
+| `validation(ValidationMode)` | `Syntax` | `None`, `Syntax`, or `Strict` |
+| `authentication_type(t)` | `None` | `AuthenticationType::None` or `AuthenticationType::Basic` |
+| `authentication_token(s)` | none | `"user:password"` for basic auth |
+| `max_queue_size(n)` | 100 000 | Max pending submissions in the intake queue |
+| `max_upload_queue_size(n)` | 1 | Dispatch queue depth between the batcher and workers |
+| `batch_bytes(n)` | 90 MB | Flush batch when accumulated bytes reach this threshold (hard cap: 90 MB) |
+| `linger(d)` | 5 ms | Flush batch after this duration even if `batch_bytes` has not been reached |
+| `max_queue_wait_time(d)` | 0 (no wait) | How long `send()` blocks when the queue is full before returning `QueueFull`; 0 means fail immediately |
+| `doris_upload_workers(n)` | 1 | Concurrent HTTP upload workers |
+| `doris_upload_timeout(d)` | 300 s | Total time budget for a batch including all retries |
+| `doris_upload_request_timeout(d)` | 300 s | Per-request HTTP timeout (minimum 10 s) |
+| `status_poll_timeout(d)` | 300 s | Timeout for label state polling on ambiguous responses |
+| `label_prefix(s)` | `"go_stream_load"` | Prefix for generated stream load labels |
+| `fake_send(bool)` | `false` | Skip real HTTP; return a synthetic success response |
+| `fake_send_delay(d)` | 500 ms | Simulated latency in fake send mode |
 | `csv_separator(s)` | `,` | CSV field separator |
 | `csv_quote(s)` | `"` | CSV quote character |
+| `callback_timeout(d)` | 100 ms | Max time allowed for a delivery callback to run |
+| `slow_callback_warn(d)` | 10 ms | Log a warning when a callback exceeds this duration |
+| `logger(fn)` | `eprintln!` | Custom log sink; receives `(LogLevel, &str)` |
+| `log_level(LogLevel)` | `Info` | Minimum level to emit: `Error`, `Info`, or `Debug` |
 | `tls_skip_verify(bool)` | `false` | Disable TLS certificate verification |
-| `tls_ca_cert_path(p)` | — | Custom CA certificate bundle (PEM) |
-| `log_level(LogLevel)` | `Info` | `Debug`, `Info`, `Warn`, `Error`, or `None` |
+| `tls_ca_cert_path(p)` | none | Custom CA certificate bundle (PEM) |
 
 ---
 
