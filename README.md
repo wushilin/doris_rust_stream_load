@@ -131,19 +131,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   
   No upload was attempted in the `Err` case.
 
-### AsyncHandle
+### Handles
+
+Both `Handle` (sync) and `AsyncHandle` (async) are **`Clone`**. All methods take `&self` — no method consumes the handle. This means:
+
+- You can clone a handle before passing it somewhere and still call `wait()` on the original.
+- Multiple threads or tasks can each hold a clone and call `wait()` concurrently — they all receive the same `DeliveryResult` once the batch completes.
+- Calling `wait()` more than once on the same handle (or on different clones) is safe and always returns the same result.
 
 ```rust
-// Async wait — resolves immediately if the batch already completed.
+// Async — clone the handle, await from two tasks independently.
+let h1 = handle.clone();
+let h2 = handle.clone();
+tokio::spawn(async move { println!("{:?}", h1.wait().await) });
+tokio::spawn(async move { println!("{:?}", h2.wait().await) });
+
+// Sync — share across threads.
+let h1 = handle.clone();
+std::thread::spawn(move || { println!("{:?}", h1.wait()); });
+println!("{:?}", handle.wait());
+```
+
+**`AsyncHandle`** — backed by a `tokio::sync::watch` channel. Each `wait()` call clones the internal receiver, giving every caller its own version cursor. Callers never race on version state. `wait()` resolves **without suspending** if the batch already completed before the call.
+
+```rust
+// Async wait — suspends until delivered; returns immediately if already done.
 let result: DeliveryResult = handle.wait().await;
 
 // Sync poll — safe to call from a plain OS thread, no Tokio runtime needed.
 if handle.is_done() {
-    let result = handle.result();
+    let result = handle.result();  // Option<DeliveryResult>
 }
 ```
 
-`AsyncHandle` uses a `tokio::sync::watch` channel internally. `wait()` calls `changed().await`, which compares receiver and sender versions before registering a waker — if the batch already completed, it resolves **without suspending**, making it safe to call at any point after `send()` returns without fear of missing the signal.
+**`Handle`** (sync) — backed by a `Mutex<Option<DeliveryResult>>` and a `Condvar`. `wait()` blocks the calling OS thread until `notify_all()` fires. Like `AsyncHandle`, it resolves immediately if the result is already present.
+
+```rust
+// Blocking wait — returns once the batch is delivered or failed.
+let result: DeliveryResult = handle.wait();
+
+// With timeout — returns None if not done within the deadline.
+if let Some(result) = handle.wait_timeout(Duration::from_secs(5)) {
+    println!("done: {:?}", result);
+}
+
+// Non-blocking poll.
+if handle.is_done() {
+    let result = handle.result();  // Option<DeliveryResult>
+}
+```
 
 ---
 
