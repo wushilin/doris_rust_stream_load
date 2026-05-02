@@ -1,0 +1,20 @@
+[package]
+name = "doris_rust_stream_load"
+version = "0.1.0"
+edition = "2021"
+authors = ["wushilin <wushilin@example.com>"]
+description = "Rust implementation of doris_go_stream_load"
+license = "Apache-2.0"
+repository = "https://github.com/wushilin/doris_rust_stream_load"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+csv = "1.2"
+url = "2"
+thiserror = "1.0"
+rand = "0.8"
+crossbeam-channel = "0.5"
+openssl = "0.10"
+tokio = { version = ">=1.0, <1.52", features = ["rt-multi-thread", "sync", "time", "macros"] }
