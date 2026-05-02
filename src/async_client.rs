@@ -42,6 +42,7 @@ impl CompletionSink for AsyncBatchCompletion {
 /// - [`AsyncHandle::wait`] — async, consumes the handle, returns [`DeliveryResult`].
 /// - [`AsyncHandle::is_done`] — sync, no Tokio runtime required.
 /// - [`AsyncHandle::result`] — sync, returns the result if already done.
+#[derive(Clone)]
 pub struct AsyncHandle {
     rx: watch::Receiver<Option<DeliveryResult>>,
 }
@@ -54,21 +55,20 @@ impl AsyncHandle {
 
     /// Await delivery completion and return the result.
     ///
-    /// `watch` version-tracks every `send()`: `changed()` resolves immediately
-    /// if the sender has already fired, so this can never miss the signal
-    /// regardless of call ordering.
-    pub async fn wait(mut self) -> DeliveryResult {
-        if let Some(r) = self.rx.borrow_and_update().clone() {
+    /// Non-consuming — safe to call multiple times and from cloned handles.
+    /// Clones the internal `watch::Receiver` so concurrent calls on the same
+    /// handle do not race on version state. Resolves immediately if the batch
+    /// already completed before this call.
+    pub async fn wait(&self) -> DeliveryResult {
+        let mut rx = self.rx.clone();
+        if let Some(r) = rx.borrow_and_update().clone() {
             return r;
         }
-        self.rx
-            .changed()
+        rx.changed()
             .await
             .expect("completion sender dropped without completing");
-        self.rx
-            .borrow()
-            .clone()
-            .expect("value must be Some after watch change")
+        let result = rx.borrow().clone();
+        result.expect("value must be Some after watch change")
     }
 
     /// Returns `true` if the delivery result is available.

@@ -204,11 +204,11 @@ impl Handle {
         }
     }
 
-    pub fn wait(self) -> DeliveryResult {
+    pub fn wait(&self) -> DeliveryResult {
         self.completion.wait()
     }
 
-    pub fn wait_timeout(self, timeout: Duration) -> Option<DeliveryResult> {
+    pub fn wait_timeout(&self, timeout: Duration) -> Option<DeliveryResult> {
         self.completion.wait_timeout(timeout)
     }
 
