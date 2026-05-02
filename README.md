@@ -435,8 +435,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 | `max_upload_queue_size(n)` | 1 | Dispatch queue depth between the batcher and workers |
 | `batch_bytes(n)` | 90 MB | Flush batch when accumulated bytes reach this threshold (hard cap: 90 MB) |
 | `linger(d)` | 5 ms | Flush batch after this duration even if `batch_bytes` has not been reached |
-| `max_queue_wait_time(d)` | 0 (no wait) | How long `send()` blocks when the queue is full before returning `QueueFull`; 0 means fail immediately |
-| `doris_upload_workers(n)` | 1 | Concurrent HTTP upload workers |
+| `max_queue_wait_time(d)` | 0 (wait forever) | How long `send()` blocks when the queue is full before returning `QueueFull`; 0 means wait indefinitely |
+| `doris_upload_workers(n)` | 4 | Concurrent HTTP upload workers |
 | `doris_upload_timeout(d)` | 300 s | Total time budget for a batch including all retries |
 | `doris_upload_request_timeout(d)` | 300 s | Per-request HTTP timeout (minimum 10 s) |
 | `status_poll_timeout(d)` | 300 s | Timeout for label state polling on ambiguous responses |
@@ -445,8 +445,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 | `fake_send_delay(d)` | 500 ms | Simulated latency in fake send mode |
 | `csv_separator(s)` | `,` | CSV field separator |
 | `csv_quote(s)` | `"` | CSV quote character |
-| `callback_timeout(d)` | 100 ms | Max time allowed for a delivery callback to run |
-| `slow_callback_warn(d)` | 10 ms | Log a warning when a callback exceeds this duration |
+| `slow_callback_warn(d)` | 10 ms | Log a warning when a delivery callback exceeds this duration |
 | `logger(fn)` | `eprintln!` | Custom log sink; receives `(LogLevel, &str)` |
 | `log_level(LogLevel)` | `Info` | Minimum level to emit: `Error`, `Info`, or `Debug` |
 | `tls_skip_verify(bool)` | `false` | Disable TLS certificate verification |

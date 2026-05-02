@@ -8,12 +8,11 @@ pub const DEFAULT_MAX_QUEUE_SIZE: usize = 100_000;
 pub const DEFAULT_MAX_UPLOAD_QUEUE_SIZE: usize = 1;
 pub const DEFAULT_BATCH_BYTES: usize = 90 * 1024 * 1024;
 pub const MAX_BATCH_BYTES: usize = 90 * 1024 * 1024;
-pub const DEFAULT_DORIS_UPLOAD_WORKERS: usize = 1;
+pub const DEFAULT_DORIS_UPLOAD_WORKERS: usize = 4;
 pub const DEFAULT_LINGER: Duration = Duration::from_millis(5);
 pub const DEFAULT_DORIS_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_DORIS_UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_STATUS_POLL_TIMEOUT: Duration = Duration::from_secs(300);
-pub const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_millis(100);
 pub const DEFAULT_SLOW_CALLBACK_WARN: Duration = Duration::from_millis(10);
 pub const DEFAULT_FAKE_SEND_DELAY: Duration = Duration::from_millis(500);
 pub const DEFAULT_CSV_SEPARATOR: &str = ",";
@@ -101,7 +100,6 @@ pub struct Config {
     pub validation: ValidationMode,
     pub doris_upload_timeout: Duration,
     pub doris_upload_request_timeout: Duration,
-    pub callback_timeout: Duration,
     pub slow_callback_warn: Duration,
     pub status_poll_timeout: Duration,
     pub label_prefix: String,
@@ -137,7 +135,6 @@ impl Default for Config {
             validation: ValidationMode::default(),
             doris_upload_timeout: DEFAULT_DORIS_UPLOAD_TIMEOUT,
             doris_upload_request_timeout: DEFAULT_DORIS_UPLOAD_REQUEST_TIMEOUT,
-            callback_timeout: DEFAULT_CALLBACK_TIMEOUT,
             slow_callback_warn: DEFAULT_SLOW_CALLBACK_WARN,
             status_poll_timeout: DEFAULT_STATUS_POLL_TIMEOUT,
             label_prefix: DEFAULT_LABEL_PREFIX.to_string(),
@@ -257,11 +254,6 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn callback_timeout(mut self, timeout: Duration) -> Self {
-        self.config.callback_timeout = timeout;
-        self
-    }
-
     pub fn slow_callback_warn(mut self, timeout: Duration) -> Self {
         self.config.slow_callback_warn = timeout;
         self
@@ -350,9 +342,6 @@ impl Config {
         }
         if self.doris_upload_request_timeout.is_zero() {
             self.doris_upload_request_timeout = DEFAULT_DORIS_UPLOAD_REQUEST_TIMEOUT;
-        }
-        if self.callback_timeout.is_zero() {
-            self.callback_timeout = DEFAULT_CALLBACK_TIMEOUT;
         }
         if self.slow_callback_warn.is_zero() {
             self.slow_callback_warn = DEFAULT_SLOW_CALLBACK_WARN;
