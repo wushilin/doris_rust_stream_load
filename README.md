@@ -197,8 +197,8 @@ if handle.is_done() {
 
 Records are coalesced into batches before upload. Two parameters control when a batch is flushed:
 
-- `batch_bytes` — flush as soon as accumulated bytes reach this threshold. The default is 90 MB (the Doris hard cap). For lower latency or smaller Doris instances, 4–20 MB is a common tuning range.
-- `linger` — flush after this duration even if `batch_bytes` has not been reached. The default is 5 ms. Increase to 50–200 ms to trade latency for larger, more efficient batches.
+- `batch_bytes` — flush as soon as accumulated bytes reach this threshold. The default is 90 MB (the library safety limit). For lower latency or smaller Doris instances, 4–20 MB is a common tuning range.
+- `linger` — flush after this duration even if `batch_bytes` has not been reached. The default is 5 ms. This ensures low latency for low-volume streams while allowing high-volume streams to be driven primarily by the byte threshold.
 
 ```rust
 .batch_bytes(8 * 1024 * 1024)   // 8 MB — lower than default for smaller clusters
@@ -474,10 +474,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 | `mode(Mode)` | `Csv` | `Mode::Csv` or `Mode::Json` |
 | `validation(ValidationMode)` | `Syntax` | `None`, `Syntax`, or `Strict` |
 | `authentication_type(t)` | `None` | `AuthenticationType::None` or `AuthenticationType::Basic` |
-| `authentication_token(s)` | none | `"user:password"` for basic auth |
-| `max_queue_size(n)` | 100 000 | Max pending submissions in the intake queue |
+| `authentication_token(s)` | none | String in `user:password` format for basic auth |
+| `max_queue_size(n)` | 100_000 | Max pending submissions in the intake queue |
 | `max_upload_queue_size(n)` | 1 | Dispatch queue depth between the batcher and workers |
-| `batch_bytes(n)` | 90 MB | Flush batch when accumulated bytes reach this threshold (hard cap: 90 MB) |
+| `batch_bytes(n)` | 90 MB | Flush batch when accumulated bytes reach this threshold (Library limit: 90 MB) |
 | `linger(d)` | 5 ms | Flush batch after this duration even if `batch_bytes` has not been reached |
 | `max_queue_wait_time(d)` | 0 (wait forever) | How long `send()` blocks when the queue is full before returning `QueueFull`; 0 means wait indefinitely |
 | `doris_upload_workers(n)` | 4 | Concurrent HTTP upload workers |
