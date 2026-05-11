@@ -7,7 +7,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
 
-/// Async counterpart of sample_use.rs.
+/// Async full-configuration example.
 ///
 /// AsyncHandle is Send, so handles can be forwarded to a plain OS thread for
 /// reaping.  The thread uses AsyncHandle::is_done() — a sync, lock-free read
@@ -24,9 +24,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     headers.insert("x-app", HeaderValue::from_static("rust-stream-load-async"));
 
     let cfg = Config::builder()
-        .endpoint("https://doris.example.com")
-        .database("sample_db")
-        .table("sample_table")
+        .stream_load_url("http://example.invalid/api/demo/events/_stream_load")
         .with_columns(["id", "name"])
         .headers(headers)
         .mode(Mode::Csv)

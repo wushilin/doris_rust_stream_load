@@ -17,7 +17,7 @@ pub const DEFAULT_SLOW_CALLBACK_WARN: Duration = Duration::from_millis(10);
 pub const DEFAULT_FAKE_SEND_DELAY: Duration = Duration::from_millis(500);
 pub const DEFAULT_CSV_SEPARATOR: &str = ",";
 pub const DEFAULT_CSV_QUOTE: &str = "\"";
-pub const DEFAULT_LABEL_PREFIX: &str = "go_stream_load";
+pub const DEFAULT_LABEL_PREFIX: &str = "rust_stream_load";
 
 pub type Logger = Arc<dyn Fn(LogLevel, &str) + Send + Sync + 'static>;
 

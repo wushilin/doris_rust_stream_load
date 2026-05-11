@@ -1,30 +1,23 @@
-# Example: simple
+# Examples
 
-This example demonstrates a full `Config` builder flow and shows how to:
+Start with the local FakeSend example:
 
-- configure endpoint/database/table or stream load URL
-- add columns and custom headers
-- set CSV mode and validation
-- enable fake send for local testing
-- submit a batch of records
-- submit a single record with callback
-- close the client cleanly
-- print runtime statistics
-
-## Run the example
-
-From the repository root:
-
-```bash
+```sh
 cargo run --example simple
 ```
 
-Run the more complete example:
+It does not require a Doris cluster.
 
-```bash
-cargo run --example sample_use
+Other runnable examples:
+
+```sh
+cargo run --example async_full_config
+cargo run --example shared_producers
+cargo run --example shared_producers_async
+cargo run --example sync_throughput_benchmark
+cargo run --example async_throughput_benchmark
+cargo run --example async_parallel_benchmark -- --threads 100000
 ```
 
-## Example file
-
-See `examples/simple.rs` and `examples/sample_use.rs` for runnable samples.
+The benchmark examples use FakeSend too, but they intentionally enqueue large
+record counts for throughput testing.

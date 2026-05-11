@@ -2,7 +2,6 @@ use crate::config::Config;
 use crate::errors::Error;
 use crate::queue::DeliveryBatch;
 use crate::types::StreamLoadResponse;
-use openssl::pkcs12::Pkcs12;
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::header::{CONTENT_LENGTH, LOCATION};
 use std::fs;
@@ -221,39 +220,9 @@ pub(crate) fn load_ca_certs(data: &[u8]) -> Result<Vec<reqwest::Certificate>, Er
         return Ok(vec![cert]);
     }
 
-    let parsed = Pkcs12::from_der(data)
-        .and_then(|pkcs12| pkcs12.parse2(""))
-        .map_err(|e| {
-            Error::InvalidConfig(format!(
-                "tls ca cert file is neither valid PEM, DER, nor passwordless PKCS12: {e}"
-            ))
-        })?;
-
-    let mut certs = Vec::new();
-    if let Some(cert) = parsed.cert {
-        let der = cert
-            .to_der()
-            .map_err(|e| Error::InvalidConfig(format!("failed to encode PKCS12 cert: {e}")))?;
-        certs.push(reqwest::Certificate::from_der(&der).map_err(|e| {
-            Error::InvalidConfig(format!("failed to load PKCS12 certificate: {e}"))
-        })?);
-    }
-    if let Some(chain) = parsed.ca {
-        for cert in chain {
-            let der = cert.to_der().map_err(|e| {
-                Error::InvalidConfig(format!("failed to encode PKCS12 CA cert: {e}"))
-            })?;
-            certs.push(reqwest::Certificate::from_der(&der).map_err(|e| {
-                Error::InvalidConfig(format!("failed to load PKCS12 CA certificate: {e}"))
-            })?);
-        }
-    }
-    if certs.is_empty() {
-        return Err(Error::InvalidConfig(
-            "no certificates found in PKCS12 CA cert file".into(),
-        ));
-    }
-    Ok(certs)
+    Err(Error::InvalidConfig(
+        "tls ca cert file must be a valid PEM bundle or DER certificate".into(),
+    ))
 }
 
 impl Sender for HttpSender {
