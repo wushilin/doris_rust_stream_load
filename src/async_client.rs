@@ -687,26 +687,18 @@ impl AsyncClient {
             .clone()
             .ok_or(Error::ClientClosed)?;
 
-        // Fast path: non-blocking send when the queue has capacity.
-        // Avoids constructing an async Future in the common case.
-        match tx.try_send(submission) {
-            Ok(()) => return Ok(handle),
-            Err(mpsc::error::TrySendError::Closed(_)) => return Err(Error::ClientClosed),
-            Err(mpsc::error::TrySendError::Full(submission)) => {
-                // Slow path: queue full — wait with optional timeout.
-                let timeout = enqueue_timeout.or_else(|| {
-                    (!self.cfg.max_queue_wait_time.is_zero())
-                        .then_some(self.cfg.max_queue_wait_time)
-                });
-                match timeout {
-                    None => tx.send(submission).await.map_err(|_| Error::ClientClosed)?,
-                    Some(t) => match tokio::time::timeout(t, tx.send(submission)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => return Err(Error::ClientClosed),
-                        Err(_) => return Err(Error::QueueFull),
-                    },
-                }
-            }
+        // Always await channel admission so sustained producers participate in
+        // Tokio's cooperative scheduling even while the queue has capacity.
+        let timeout = enqueue_timeout.or_else(|| {
+            (!self.cfg.max_queue_wait_time.is_zero()).then_some(self.cfg.max_queue_wait_time)
+        });
+        match timeout {
+            None => tx.send(submission).await.map_err(|_| Error::ClientClosed)?,
+            Some(t) => match tokio::time::timeout(t, tx.send(submission)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(Error::ClientClosed),
+                Err(_) => return Err(Error::QueueFull),
+            },
         }
 
         Ok(handle)
@@ -1118,5 +1110,46 @@ fn next_backoff(current: Duration, max: Duration) -> Duration {
         max
     } else {
         next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_yields_during_a_burst_with_spare_queue_capacity() {
+        let mut cfg = Config::default();
+        cfg.stream_load_url =
+            Some("http://doris.example.com/api/test_db/test_table/_stream_load".to_string());
+        cfg.columns = vec!["id".to_string(), "name".to_string()];
+        cfg.mode = Mode::Csv;
+        cfg.validation = ValidationMode::None;
+        cfg.fake_send = true;
+        cfg.fake_send_delay_set = true;
+        cfg.max_queue_size = 10_000;
+        cfg.batch_bytes = 90 * 1024 * 1024;
+        cfg.linger = Duration::from_secs(60);
+
+        let client = AsyncClient::new(cfg).expect("client should build");
+        let peer_ran = Arc::new(AtomicBool::new(false));
+        let peer_ran_clone = peer_ran.clone();
+        let peer = tokio::spawn(async move {
+            peer_ran_clone.store(true, Ordering::SeqCst);
+        });
+
+        for i in 0..1_000 {
+            client
+                .send(format!("{i},user{i}"))
+                .await
+                .expect("send should succeed");
+        }
+
+        assert!(
+            peer_ran.load(Ordering::SeqCst),
+            "successful sends should consume Tokio task budget"
+        );
+        peer.await.expect("peer task should finish");
+        client.close().await.expect("close should succeed");
     }
 }

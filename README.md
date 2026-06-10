@@ -478,3 +478,12 @@ let cfg = Config::builder()
 ```sh
 cargo test
 ```
+
+## Changelog
+
+### 0.1.2 - 2026-06-10
+
+- Make successful `AsyncClient` queue admission participate in Tokio's
+  cooperative task budget, preventing sustained producers from starving the
+  batcher and uploader tasks.
+- Add a single-threaded Tokio regression test for async send fairness.

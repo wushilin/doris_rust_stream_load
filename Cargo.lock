@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "doris_rust_stream_load"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "crossbeam-channel",
  "csv",
