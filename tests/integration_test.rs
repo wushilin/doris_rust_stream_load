@@ -500,3 +500,296 @@ fn has_header_value(request: &str, expected_name: &str, expected_value: &str) ->
         name.trim().eq_ignore_ascii_case(expected_name) && value.trim() == expected_value
     })
 }
+
+// ── Failure handling: label check + retry with a fresh label ─────────────────
+
+/// One scripted HTTP exchange: the server accepts a connection, reads the
+/// request, and answers with `status` / `body`. Returns the observed
+/// `(request line, label header)` pairs once every step has been served.
+fn spawn_scripted_server(
+    listener: TcpListener,
+    steps: Vec<(u16, &'static str)>,
+) -> thread::JoinHandle<Vec<(String, Option<String>)>> {
+    thread::spawn(move || {
+        let mut seen = Vec::new();
+        for (status, body) in steps {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let request = read_http_request(&mut stream);
+            let request_line = request.lines().next().unwrap_or_default().to_string();
+            let label = request.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("label")
+                    .then(|| value.trim().to_string())
+            });
+            seen.push((request_line, label));
+            let reason = if status == 200 { "OK" } else { "Error" };
+            write_response(
+                &mut stream,
+                status,
+                reason,
+                &[("Content-Type", "application/json")],
+                body,
+            );
+        }
+        seen
+    })
+}
+
+fn http_cfg(addr: std::net::SocketAddr) -> doris_rust_stream_load::ConfigBuilder {
+    Config::builder()
+        .stream_load_url(format!("http://{addr}/api/test_db/test_table/_stream_load"))
+        .with_columns(["id", "name"])
+        .mode(Mode::Csv)
+        .validation(ValidationMode::Syntax)
+        .doris_upload_request_timeout(Duration::from_secs(10))
+}
+
+const TOO_MANY_VERSIONS: &str =
+    r#"{"Status":"Fail","Message":"[INTERNAL_ERROR]too many versions. tablet_id=1"}"#;
+const SUCCESS: &str = r#"{"Status":"Success","Label":"x","NumberLoadedRows":1}"#;
+
+fn failed_load_is_retried_with_new_label_when_label_is(terminal_state: &'static str) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    let state_body: &'static str = Box::leak(
+        format!(r#"{{"msg":"success","code":0,"data":"{terminal_state}","count":0}}"#)
+            .into_boxed_str(),
+    );
+    let server = spawn_scripted_server(
+        listener,
+        vec![(200, TOO_MANY_VERSIONS), (200, state_body), (200, SUCCESS)],
+    );
+
+    let cfg = http_cfg(addr)
+        .log_level(doris_rust_stream_load::LogLevel::Error)
+        .build()
+        .expect("config should build");
+    let client = Client::new(cfg).expect("client should build");
+    let result = client
+        .send("1,alice".to_string())
+        .expect("send should succeed")
+        .wait();
+    assert!(result.success(), "result={result:?}");
+    assert_eq!(result.attempts, 2);
+    client.close().expect("close should succeed");
+
+    let seen = server.join().expect("server should finish");
+    assert!(
+        seen[0].0.starts_with("PUT "),
+        "first request: {}",
+        seen[0].0
+    );
+    assert!(
+        seen[1].0.starts_with("GET ") && seen[1].0.contains("/api/test_db/get_load_state?label="),
+        "label check request: {}",
+        seen[1].0
+    );
+    assert!(
+        seen[2].0.starts_with("PUT "),
+        "retry request: {}",
+        seen[2].0
+    );
+    let first_label = seen[0].1.clone().expect("first label");
+    let retry_label = seen[2].1.clone().expect("retry label");
+    assert_ne!(first_label, retry_label, "retry must use a fresh label");
+    assert!(
+        seen[1].0.contains(&first_label),
+        "label check must query the failed label"
+    );
+}
+
+#[test]
+fn failed_load_with_aborted_label_is_retried_with_new_label() {
+    failed_load_is_retried_with_new_label_when_label_is("ABORTED");
+}
+
+#[test]
+fn failed_load_with_unknown_label_is_retried_with_new_label() {
+    failed_load_is_retried_with_new_label_when_label_is("UNKNOWN");
+}
+
+#[test]
+fn failed_load_whose_label_became_visible_is_a_success() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    let server = spawn_scripted_server(
+        listener,
+        vec![
+            (500, r#"{"Status":"Fail","Message":"publish timeout"}"#),
+            (
+                200,
+                r#"{"msg":"success","code":0,"data":"VISIBLE","count":0}"#,
+            ),
+        ],
+    );
+
+    let cfg = http_cfg(addr).build().expect("config should build");
+    let client = Client::new(cfg).expect("client should build");
+    let result = client
+        .send("1,alice".to_string())
+        .expect("send should succeed")
+        .wait();
+    assert!(result.success(), "result={result:?}");
+    assert_eq!(result.attempts, 1);
+    client.close().expect("close should succeed");
+    let seen = server.join().expect("server should finish");
+    assert_eq!(seen.len(), 2);
+}
+
+#[test]
+fn auth_failure_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    let server = spawn_scripted_server(listener, vec![(401, r#"{"msg":"Access denied"}"#)]);
+
+    let cfg = http_cfg(addr).build().expect("config should build");
+    let client = Client::new(cfg).expect("client should build");
+    let result = client
+        .send("1,alice".to_string())
+        .expect("send should succeed")
+        .wait();
+    assert!(!result.success());
+    assert_eq!(result.attempts, 1);
+    assert_eq!(result.status_code, 401);
+    client.close().expect("close should succeed");
+    assert_eq!(server.join().expect("server should finish").len(), 1);
+}
+
+#[test]
+fn max_retries_bounds_label_retries_and_reports_last_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    const ABORTED: &str = r#"{"msg":"success","code":0,"data":"ABORTED","count":0}"#;
+    let server = spawn_scripted_server(
+        listener,
+        vec![
+            (200, TOO_MANY_VERSIONS),
+            (200, ABORTED),
+            (200, TOO_MANY_VERSIONS),
+            (200, ABORTED),
+        ],
+    );
+
+    let cfg = http_cfg(addr)
+        .max_retries(1)
+        .log_level(doris_rust_stream_load::LogLevel::Error)
+        .build()
+        .expect("config should build");
+    let client = Client::new(cfg).expect("client should build");
+    let result = client
+        .send("1,alice".to_string())
+        .expect("send should succeed")
+        .wait();
+    assert!(!result.success());
+    assert_eq!(result.attempts, 2);
+    assert_eq!(result.status_code, 200);
+    let message = result.err.as_ref().unwrap().to_string();
+    assert!(message.contains("too many versions"), "err={message}");
+    assert_eq!(
+        result.response.as_ref().and_then(|r| r.status.as_deref()),
+        Some("Fail")
+    );
+    client.close().expect("close should succeed");
+    assert_eq!(server.join().expect("server should finish").len(), 4);
+}
+
+#[test]
+fn inconclusive_label_check_fails_with_original_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    // A definitive non-state reply to the label check must not be polled
+    // again for `status_poll_timeout`.
+    let server = spawn_scripted_server(
+        listener,
+        vec![
+            (200, TOO_MANY_VERSIONS),
+            (404, r#"{"msg":"Not Found","code":404}"#),
+        ],
+    );
+
+    let cfg = http_cfg(addr).build().expect("config should build");
+    let client = Client::new(cfg).expect("client should build");
+    let started = std::time::Instant::now();
+    let result = client
+        .send("1,alice".to_string())
+        .expect("send should succeed")
+        .wait();
+    assert!(!result.success());
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(result.attempts, 1);
+    assert_eq!(result.status_code, 200);
+    let message = result.err.as_ref().unwrap().to_string();
+    assert!(message.contains("too many versions"), "err={message}");
+    assert!(message.contains("state check failed"), "err={message}");
+    client.close().expect("close should succeed");
+    assert_eq!(server.join().expect("server should finish").len(), 2);
+}
+
+// ── Accumulator: linger expiry does not block on busy workers ────────────────
+
+#[test]
+fn linger_expiry_keeps_accumulating_while_workers_are_busy() {
+    let mut cfg = fake_cfg(Mode::Csv, ValidationMode::None);
+    cfg.fake_send_delay = Duration::from_millis(600);
+    cfg.doris_upload_workers = 1;
+    cfg.max_upload_queue_size = 1;
+    cfg.linger = Duration::from_millis(10);
+    let client = Client::new(cfg).expect("client should build");
+
+    // First batch occupies the only worker; second fills the upload queue slot.
+    let first = client.send("1,a".to_string()).expect("send");
+    thread::sleep(Duration::from_millis(60));
+    let second = client.send("2,b".to_string()).expect("send");
+    thread::sleep(Duration::from_millis(60));
+
+    // Everything sent while the worker is busy and the slot is taken must
+    // coalesce into a single batch instead of one batch per linger window.
+    let rest: Vec<_> = (3..13)
+        .map(|i| {
+            let handle = client.send(format!("{i},x")).expect("send");
+            thread::sleep(Duration::from_millis(20));
+            handle
+        })
+        .collect();
+
+    let label_of = |h: &doris_rust_stream_load::Handle| {
+        let r = h.wait();
+        assert!(r.success());
+        r.response.unwrap().label.unwrap()
+    };
+    let first_label = label_of(&first);
+    let second_label = label_of(&second);
+    let rest_labels: Vec<_> = rest.iter().map(label_of).collect();
+    assert_ne!(first_label, second_label);
+    assert!(
+        rest_labels.iter().all(|l| l == &rest_labels[0]),
+        "records sent while the worker was busy should share one batch: {rest_labels:?}"
+    );
+    assert_ne!(rest_labels[0], second_label);
+    client.close().expect("close should succeed");
+    assert_eq!(client.stats().total_load_jobs, 3);
+}
+
+#[test]
+fn full_batches_wait_for_a_worker_and_never_exceed_batch_bytes() {
+    let mut cfg = fake_cfg(Mode::Csv, ValidationMode::None);
+    cfg.fake_send_delay = Duration::from_millis(20);
+    cfg.doris_upload_workers = 1;
+    cfg.max_upload_queue_size = 1;
+    cfg.linger = Duration::from_millis(5);
+    cfg.batch_bytes = 40;
+    let client = Client::new(cfg).expect("client should build");
+
+    let handles: Vec<_> = (0..50)
+        .map(|i| client.send(format!("{i:02},abcd")).expect("send"))
+        .collect();
+    for handle in &handles {
+        let result = handle.wait();
+        assert!(result.success(), "result={result:?}");
+        let load_bytes = result.response.unwrap().load_bytes.unwrap();
+        assert!(load_bytes <= 40, "batch exceeded batch_bytes: {load_bytes}");
+    }
+    client.close().expect("close should succeed");
+    assert!(client.stats().total_load_jobs >= 10);
+}

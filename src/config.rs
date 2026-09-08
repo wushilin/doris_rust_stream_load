@@ -9,6 +9,7 @@ pub const DEFAULT_MAX_UPLOAD_QUEUE_SIZE: usize = 1;
 pub const DEFAULT_BATCH_BYTES: usize = 90 * 1024 * 1024;
 pub const MAX_BATCH_BYTES: usize = 90 * 1024 * 1024;
 pub const DEFAULT_DORIS_UPLOAD_WORKERS: usize = 4;
+pub const DEFAULT_MAX_RETRIES: usize = 0;
 pub const DEFAULT_LINGER: Duration = Duration::from_millis(5);
 pub const DEFAULT_DORIS_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_DORIS_UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -100,6 +101,9 @@ pub struct Config {
     pub validation: ValidationMode,
     pub doris_upload_timeout: Duration,
     pub doris_upload_request_timeout: Duration,
+    /// Maximum number of re-uploads after a failed attempt. `0` means no
+    /// count limit; retries are then bounded only by `doris_upload_timeout`.
+    pub max_retries: usize,
     pub slow_callback_warn: Duration,
     pub status_poll_timeout: Duration,
     pub label_prefix: String,
@@ -135,6 +139,7 @@ impl Default for Config {
             validation: ValidationMode::default(),
             doris_upload_timeout: DEFAULT_DORIS_UPLOAD_TIMEOUT,
             doris_upload_request_timeout: DEFAULT_DORIS_UPLOAD_REQUEST_TIMEOUT,
+            max_retries: DEFAULT_MAX_RETRIES,
             slow_callback_warn: DEFAULT_SLOW_CALLBACK_WARN,
             status_poll_timeout: DEFAULT_STATUS_POLL_TIMEOUT,
             label_prefix: DEFAULT_LABEL_PREFIX.to_string(),
@@ -251,6 +256,13 @@ impl ConfigBuilder {
 
     pub fn doris_upload_request_timeout(mut self, timeout: Duration) -> Self {
         self.config.doris_upload_request_timeout = timeout;
+        self
+    }
+
+    /// Cap the number of re-uploads per batch. `0` (default) disables the
+    /// count limit; retries then stop only when `doris_upload_timeout` elapses.
+    pub fn max_retries(mut self, retries: usize) -> Self {
+        self.config.max_retries = retries;
         self
     }
 

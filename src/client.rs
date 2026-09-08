@@ -1,9 +1,12 @@
 use crate::config::{Config, LogLevel, Mode, ValidationMode};
 use crate::errors::{Error, Result};
 use crate::queue::{DeliveryBatch, DequeueWaitResult, QueueItem, QueuedSubmission, RequestQueue};
-use crate::sender::{FakeSender, HttpSender, Sender, StreamLoadError};
+use crate::sender::{
+    failure_action, poll_error_is_transient, FailureAction, FakeSender, HttpSender, Sender,
+    StreamLoadError,
+};
 use crate::types::{ClientStats, DeliveryCallback, DeliveryResult, Handle, StreamLoadResponse};
-use crossbeam_channel::{bounded, Receiver, Sender as ChannelSender};
+use crossbeam_channel::{bounded, Receiver, Sender as ChannelSender, TrySendError};
 use serde::de::{
     DeserializeSeed, Deserializer, Error as SerdeError, IgnoredAny, MapAccess, Visitor,
 };
@@ -508,122 +511,141 @@ fn run_batcher(
     stats: Arc<ClientStatsCollector>,
     cfg: Config,
 ) {
-    let mut current: Option<DeliveryBatch> = None;
-
-    let flush = |batch: &mut Option<DeliveryBatch>| {
-        if let Some(batch) = batch.take() {
-            if let Err(err) = dispatch.send(batch) {
-                complete_batch(
-                    err.0,
-                    stats.clone(),
-                    DeliveryResult {
-                        err: Some(Error::Internal(
-                            "dispatch channel closed before batch delivery".into(),
-                        )),
-                        attempts: 0,
-                        status_code: 0,
-                        response: None,
-                        started_at: SystemTime::now(),
-                        finished_at: SystemTime::now(),
-                    },
-                    &cfg,
-                );
-            }
-        }
+    let mut acc = Accumulator {
+        current: None,
+        linger_deadline: Instant::now(),
+        dispatch: &dispatch,
+        stats: &stats,
+        cfg: &cfg,
     };
 
     loop {
-        let result = intake.dequeue_batch(cfg.batch_bytes);
-        if result.is_none() {
-            flush(&mut current);
-            drop(dispatch);
-            return;
-        }
-        let (submissions, _) = result.unwrap();
-        for submission in submissions {
-            let need_flush = current
-                .as_ref()
-                .map(|batch| {
-                    batch.len() > 0
-                        && cfg.batch_bytes > 0
-                        && batch.byte_size + submission.append_byte_size > cfg.batch_bytes
-                })
-                .unwrap_or(false);
-            if need_flush {
-                flush(&mut current);
-            }
-            if current.is_none() {
-                current = Some(DeliveryBatch::new());
-            }
-            if let Some(batch) = current.as_mut() {
-                batch.add_submission(submission, &cfg);
-                if cfg.batch_bytes > 0 && batch.byte_size >= cfg.batch_bytes {
-                    flush(&mut current);
-                }
-            }
+        if acc.current.is_none() {
+            // Nothing open: block until the first submission arrives.
+            let Some((submissions, _)) = intake.dequeue_batch(cfg.batch_bytes) else {
+                // Intake closed and drained. Returning drops `dispatch`, which
+                // tells the workers that no more batches are coming.
+                return;
+            };
+            acc.absorb(submissions);
+            continue;
         }
 
-        loop {
-            if current.as_ref().map_or(true, |b| b.len() == 0) {
-                break;
+        let now = Instant::now();
+        if now >= acc.linger_deadline {
+            // Linger expired. Hand the batch over only if a worker (or a free
+            // upload-queue slot) can take it right now; otherwise keep
+            // accumulating for another linger window instead of parking the
+            // batcher on a small batch while intake piles up behind it.
+            if acc.try_dispatch() {
+                continue;
             }
-            let elapsed = current
-                .as_ref()
-                .unwrap()
-                .created_at
-                .elapsed()
-                .unwrap_or(Duration::ZERO);
-            if elapsed >= cfg.linger {
-                flush(&mut current);
-                break;
-            }
-            let remaining = if cfg.batch_bytes > 0 {
-                cfg.batch_bytes
-                    .saturating_sub(current.as_ref().unwrap().byte_size)
-            } else {
-                usize::MAX
-            };
-            if cfg.batch_bytes > 0 && remaining == 0 {
-                flush(&mut current);
-                break;
-            }
-            match intake.dequeue_batch_wait(remaining, cfg.linger - elapsed) {
-                DequeueWaitResult::Batch(submissions) => {
-                    for submission in submissions {
-                        let need_flush = current
-                            .as_ref()
-                            .map(|batch| {
-                                batch.len() > 0
-                                    && cfg.batch_bytes > 0
-                                    && batch.byte_size + submission.append_byte_size
-                                        > cfg.batch_bytes
-                            })
-                            .unwrap_or(false);
-                        if need_flush {
-                            flush(&mut current);
-                        }
-                        if current.is_none() {
-                            current = Some(DeliveryBatch::new());
-                        }
-                        if let Some(batch) = current.as_mut() {
-                            batch.add_submission(submission, &cfg);
-                            if cfg.batch_bytes > 0 && batch.byte_size >= cfg.batch_bytes {
-                                flush(&mut current);
-                            }
-                        }
-                    }
-                }
-                DequeueWaitResult::Timeout => {
-                    flush(&mut current);
-                    break;
-                }
-                DequeueWaitResult::Closed => {
-                    flush(&mut current);
-                    drop(dispatch);
-                    return;
-                }
+            acc.linger_deadline = now + cfg.linger;
+        }
+
+        let wait = acc
+            .linger_deadline
+            .saturating_duration_since(Instant::now());
+        match intake.dequeue_batch_wait(acc.remaining_bytes(), wait) {
+            DequeueWaitResult::Batch(submissions) => acc.absorb(submissions),
+            DequeueWaitResult::Timeout => {}
+            DequeueWaitResult::Closed => {
+                acc.dispatch_blocking();
+                return;
             }
         }
+    }
+}
+
+/// Batch accumulator used by the batcher thread.
+struct Accumulator<'a> {
+    current: Option<DeliveryBatch>,
+    /// Earliest point at which the open batch may be handed to a worker.
+    linger_deadline: Instant,
+    dispatch: &'a ChannelSender<DeliveryBatch>,
+    stats: &'a Arc<ClientStatsCollector>,
+    cfg: &'a Config,
+}
+
+impl Accumulator<'_> {
+    /// Append submissions to the open batch. A batch that fills up (or cannot
+    /// take the next submission) is full and waits for a worker.
+    fn absorb(&mut self, submissions: Vec<QueuedSubmission>) {
+        for submission in submissions {
+            let overflow = self.current.as_ref().is_some_and(|batch| {
+                batch.len() > 0
+                    && self.cfg.batch_bytes > 0
+                    && batch.byte_size + submission.append_byte_size > self.cfg.batch_bytes
+            });
+            if overflow {
+                self.dispatch_blocking();
+            }
+            if self.current.is_none() {
+                self.current = Some(DeliveryBatch::new());
+                self.linger_deadline = Instant::now() + self.cfg.linger;
+            }
+            let batch = self.current.as_mut().unwrap();
+            batch.add_submission(submission, self.cfg);
+            if self.cfg.batch_bytes > 0 && batch.byte_size >= self.cfg.batch_bytes {
+                self.dispatch_blocking();
+            }
+        }
+    }
+
+    fn remaining_bytes(&self) -> usize {
+        if self.cfg.batch_bytes == 0 {
+            return usize::MAX;
+        }
+        self.current.as_ref().map_or(self.cfg.batch_bytes, |batch| {
+            self.cfg.batch_bytes.saturating_sub(batch.byte_size)
+        })
+    }
+
+    /// Hand the open batch to a worker, waiting for one if necessary.
+    fn dispatch_blocking(&mut self) {
+        let Some(batch) = self.current.take() else {
+            return;
+        };
+        if let Err(err) = self.dispatch.send(batch) {
+            self.fail_dispatch(err.0);
+        }
+    }
+
+    /// Hand the open batch to a worker only if that would not block.
+    /// Returns `true` if the batch left the accumulator.
+    fn try_dispatch(&mut self) -> bool {
+        let Some(batch) = self.current.take() else {
+            return true;
+        };
+        match self.dispatch.try_send(batch) {
+            Ok(()) => true,
+            Err(TrySendError::Full(batch)) => {
+                self.current = Some(batch);
+                false
+            }
+            Err(TrySendError::Disconnected(batch)) => {
+                self.fail_dispatch(batch);
+                true
+            }
+        }
+    }
+
+    fn fail_dispatch(&self, batch: DeliveryBatch) {
+        complete_batch(
+            batch,
+            self.stats.clone(),
+            DeliveryResult {
+                err: Some(Error::Internal(
+                    "dispatch channel closed before batch delivery".into(),
+                )),
+                attempts: 0,
+                status_code: 0,
+                response: None,
+                started_at: SystemTime::now(),
+                finished_at: SystemTime::now(),
+            },
+            self.cfg,
+        );
     }
 }
 
@@ -648,110 +670,143 @@ fn deliver_batch(
     cfg: Config,
 ) {
     let started = SystemTime::now();
-    let mut attempts = 0;
-    let mut retry_deadline = if cfg.doris_upload_timeout > Duration::ZERO {
-        Some(Instant::now() + cfg.doris_upload_timeout)
-    } else {
-        None
-    };
+    let deadline = Instant::now() + cfg.doris_upload_timeout;
+    let mut attempts = 0usize;
 
     loop {
-        if attempts > 0 {
-            if let Some(deadline) = retry_deadline {
-                if Instant::now() > deadline {
-                    complete_batch(
-                        batch,
-                        stats,
-                        DeliveryResult {
-                            err: Some(Error::Timeout),
-                            attempts,
-                            status_code: 0,
-                            response: None,
-                            started_at: started,
-                            finished_at: SystemTime::now(),
-                        },
-                        &cfg,
-                    );
-                    return;
-                }
-            }
-        }
-
         attempts += 1;
         stats.record_upload_attempt(batch.byte_size as i64, batch.len() as i64);
-        let outcome = sender.send(&batch, cfg.doris_upload_request_timeout);
-        match outcome {
+        let err = match sender.send(&batch, cfg.doris_upload_request_timeout) {
             Ok(outcome) => {
-                let result = DeliveryResult {
-                    err: None,
-                    attempts,
-                    status_code: outcome.status_code,
-                    response: outcome.response,
-                    started_at: started,
-                    finished_at: SystemTime::now(),
-                };
-                complete_batch(batch, stats, result, &cfg);
-                return;
-            }
-            Err(err) => {
-                let mut retriable = err.retriable();
-                let mut ambiguous = err.ambiguous();
-                let mut final_err = err;
-                if ambiguous {
-                    match poll_label_until_conclusion(
-                        &batch.label,
-                        started,
+                complete_batch(
+                    batch,
+                    stats,
+                    DeliveryResult {
+                        err: None,
                         attempts,
-                        sender.clone(),
-                        &cfg,
-                    ) {
-                        Ok(result) => {
-                            complete_batch(batch, stats, result, &cfg);
-                            return;
-                        }
-                        Err(err2) => {
-                            retriable = err2.retriable();
-                            ambiguous = err2.ambiguous();
-                            final_err = err2;
-                            if retriable {
-                                batch.label = crate::queue::generate_label(&cfg.label_prefix);
-                            }
-                        }
-                    }
-                }
-                if !retriable {
-                    let result = DeliveryResult {
-                        err: Some(Error::Http(final_err.message())),
-                        attempts,
-                        status_code: final_err.status_code(),
-                        response: final_err.response().cloned(),
+                        status_code: outcome.status_code,
+                        response: outcome.response,
                         started_at: started,
                         finished_at: SystemTime::now(),
-                    };
-                    complete_batch(batch, stats, result, &cfg);
-                    return;
-                }
-                if retry_deadline.is_none() {
-                    retry_deadline = Some(Instant::now() + cfg.doris_upload_timeout);
-                }
-                if let Some(deadline) = retry_deadline {
-                    if Instant::now() > deadline {
-                        let result = DeliveryResult {
-                            err: Some(Error::Timeout),
-                            attempts,
-                            status_code: final_err.status_code(),
-                            response: final_err.response().cloned(),
-                            started_at: started,
-                            finished_at: SystemTime::now(),
-                        };
+                    },
+                    &cfg,
+                );
+                return;
+            }
+            Err(err) => err,
+        };
+
+        // Decide whether this attempt is really dead. Anything Doris might
+        // have registered is settled by asking Doris for the label's final
+        // state, so an unknown failure ("too many versions", ...) becomes a
+        // retry with a fresh label instead of a terminal error.
+        match failure_action(&err) {
+            FailureAction::RetryNow => {}
+            FailureAction::Fail => {
+                complete_batch(
+                    batch,
+                    stats,
+                    failed_result(&err, None, attempts, started),
+                    &cfg,
+                );
+                return;
+            }
+            FailureAction::CheckLabel => {
+                match poll_label_until_conclusion(
+                    &batch.label,
+                    started,
+                    attempts,
+                    sender.clone(),
+                    &cfg,
+                ) {
+                    Ok(result) => {
                         complete_batch(batch, stats, result, &cfg);
                         return;
                     }
+                    Err(poll_err) if poll_err.retriable() => {
+                        // Label concluded as ABORTED / UNKNOWN: terminal failure.
+                    }
+                    Err(poll_err) => {
+                        let message = format!(
+                            "{}; label {} state check failed: {}",
+                            err.message(),
+                            batch.label,
+                            poll_err.message()
+                        );
+                        complete_batch(
+                            batch,
+                            stats,
+                            failed_result(&err, Some(message), attempts, started),
+                            &cfg,
+                        );
+                        return;
+                    }
                 }
-                let backoff = retry_backoff_delay(attempts);
-                std::thread::sleep(backoff);
             }
         }
+
+        if cfg.max_retries > 0 && attempts > cfg.max_retries {
+            let message = format!("{} (giving up after {} attempts)", err.message(), attempts);
+            complete_batch(
+                batch,
+                stats,
+                failed_result(&err, Some(message), attempts, started),
+                &cfg,
+            );
+            return;
+        }
+
+        let backoff = retry_backoff_delay(attempts);
+        if Instant::now() + backoff > deadline {
+            complete_batch(
+                batch,
+                stats,
+                DeliveryResult {
+                    err: Some(Error::Timeout),
+                    attempts,
+                    status_code: err.status_code(),
+                    response: err.response().cloned(),
+                    started_at: started,
+                    finished_at: SystemTime::now(),
+                },
+                &cfg,
+            );
+            return;
+        }
+
+        let old_label = std::mem::replace(
+            &mut batch.label,
+            crate::queue::generate_label(&cfg.label_prefix),
+        );
+        cfg.log(
+            LogLevel::Info,
+            &format!(
+                "stream load attempt {} for label {} failed (status={}): {}; retrying as label {} in {:?}",
+                attempts,
+                old_label,
+                err.status_code(),
+                err.message(),
+                batch.label,
+                backoff
+            ),
+        );
+        std::thread::sleep(backoff);
+    }
+}
+
+fn failed_result(
+    err: &StreamLoadError,
+    message: Option<String>,
+    attempts: usize,
+    started: SystemTime,
+) -> DeliveryResult {
+    DeliveryResult {
+        err: Some(Error::Http(message.unwrap_or_else(|| err.message()))),
+        attempts,
+        status_code: err.status_code(),
+        response: err.response().cloned(),
+        started_at: started,
+        finished_at: SystemTime::now(),
     }
 }
 
@@ -792,7 +847,6 @@ fn poll_label_until_conclusion(
                         response: None,
                     });
                 }
-                "PREPARE" | "PRECOMMITTED" => {}
                 "UNKNOWN" => {
                     return Err(StreamLoadError::Error {
                         status_code: state.status_code,
@@ -802,10 +856,11 @@ fn poll_label_until_conclusion(
                         response: None,
                     });
                 }
+                // PREPARE / PRECOMMITTED and anything unrecognised: keep polling.
                 _ => {}
             },
             Err(err) => {
-                if Instant::now() > deadline {
+                if !poll_error_is_transient(&err) || Instant::now() > deadline {
                     return Err(err);
                 }
             }

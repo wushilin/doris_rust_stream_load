@@ -347,7 +347,7 @@ Batching and queueing:
 | Builder method | Default | Description |
 |---|---|---|
 | `batch_bytes(n)` | `90 MiB` | Max outbound request body size; also the per-send admission limit |
-| `linger(d)` | `5ms` | Max age of an open outbound batch before dispatch |
+| `linger(d)` | `5ms` | Age at which an open batch is offered to a worker; if every worker is busy and the upload queue is full, the batch keeps accumulating in further `linger` windows until it reaches `batch_bytes` |
 | `max_queue_size(n)` | `100000` | Max submitted items in the intake queue |
 | `max_queue_wait_time(d)` | `0` | How long `send` waits for queue space; `0` waits indefinitely |
 | `max_upload_queue_size(n)` | `1` | Channel depth between batcher and upload workers |
@@ -358,7 +358,8 @@ Retry and timing:
 | Builder method | Default | Description |
 |---|---|---|
 | `doris_upload_request_timeout(d)` | `300s` | HTTP deadline for one upload or label-poll request; minimum `10s` |
-| `doris_upload_timeout(d)` | `300s` | Total retry decision budget after retriable upload outcomes |
+| `doris_upload_timeout(d)` | `300s` | Total retry budget per batch, covering uploads, label checks, and backoff |
+| `max_retries(n)` | `0` (unlimited) | Cap on re-uploads per batch; `0` leaves retries bounded only by `doris_upload_timeout` |
 | `status_poll_timeout(d)` | `300s` | Max time spent polling a label after an ambiguous outcome |
 | `slow_callback_warn(d)` | `10ms` | Slow callback warning threshold |
 
@@ -377,6 +378,22 @@ Behavior:
 
 `batch_bytes` and `linger` work together like Kafka `batch.size` and `linger.ms`: the SDK dispatches when the payload reaches `batch_bytes` or the open batch reaches `linger`, whichever happens first.
 
+Dispatch at `linger` is opportunistic. When the open batch reaches `linger`, the batcher hands it over only if a worker or a free `max_upload_queue_size` slot can take it without blocking. If all workers are busy, the batch stays open and keeps absorbing records for another `linger` window, so a saturated cluster receives fewer, larger loads instead of a stream of tiny ones. Only a batch that has reached `batch_bytes` (or cannot fit the next record) makes the batcher wait for a worker.
+
+## Retries and Label Checks
+
+Every upload uses a unique Doris label. When an upload attempt does not come back as a success, the SDK decides what to do in the same way the Flink Doris connector does:
+
+1. A connection failure that never reached Doris is retried directly.
+2. An HTTP 401/403 is treated as permanent and fails immediately.
+3. Any other failure, including unrecognised Doris errors such as `too many versions` and ambiguous transport errors, triggers a label check via `GET /api/{db}/get_load_state?label=...`:
+   - `VISIBLE` / `COMMITTED`: the data landed; the batch is reported as a success.
+   - `ABORTED` / `UNKNOWN`: the attempt is dead; the batch is re-uploaded under a fresh label after a backoff of 1s, 2s, 4s, 4s, ...
+   - `PREPARE` / `PRECOMMITTED`: the SDK keeps polling up to `status_poll_timeout`.
+   - A definitive non-state reply (for example a 4xx from the label endpoint) fails the batch with the original upload error.
+
+Retries stop when `doris_upload_timeout` elapses (the result carries `Error::Timeout` plus the last Doris response) or, if `max_retries` is set, after that many re-uploads (the result carries the last Doris error). Each retry is logged at `LogLevel::Info`.
+
 ## Common Errors
 
 `send(...)` and `send_batch(...)` can fail before data enters the SDK queue:
@@ -392,11 +409,13 @@ Delivery can fail after queue admission; check `DeliveryResult.err` from the han
 
 | Failure | Meaning | Typical action |
 |---|---|---|
-| HTTP 4xx from Doris | Bad URL, auth, table, schema, label, or data format | Inspect `status_code` and Doris response message |
-| HTTP 5xx or retriable transport error | Doris/BE/network may be unavailable | The SDK retries within `doris_upload_timeout`; check cluster health |
+| HTTP 401/403 from Doris | Bad credentials or missing privileges | Fails immediately without retry; fix `authentication_token` |
+| Doris `Status: Fail` or other HTTP 4xx/5xx | Schema, data format, `too many versions`, memory limit, BE unavailable, ... | The SDK checks the label and re-uploads under a fresh label until `doris_upload_timeout` / `max_retries`; inspect `response` for the last Doris message |
+| Connection failure | Doris/FE/network unreachable | The SDK retries within `doris_upload_timeout`; check cluster health |
 | Ambiguous transport error | Request may have reached Doris but response was lost | The SDK polls the load label to decide whether it became visible |
-| Label state `UNKNOWN` | Doris does not know the label | The transaction was not registered; final result is failure |
+| Label state `ABORTED` / `UNKNOWN` | The attempt did not commit | The batch is retried with a fresh label |
 | Status poll timeout | Doris did not reach a final visible/failed state in time | Increase `status_poll_timeout` or inspect Doris load jobs |
+| `Error::Timeout` | Retries ran out of `doris_upload_timeout` | `response` holds the last Doris reply; check cluster health, compaction, or data |
 | Slow callback | Callback exceeded `slow_callback_warn` and produced a log | Keep callbacks small; hand work to another thread/task if needed |
 
 ## Shutdown
@@ -480,6 +499,22 @@ cargo test
 ```
 
 ## Changelog
+
+### 0.1.3 - 2026-09-08
+
+- Consult the load label after any failed upload and retry with a fresh
+  label when Doris reports the label as `ABORTED` or `UNKNOWN`. Unrecognised
+  Doris errors such as `too many versions` no longer fail the batch on the
+  first attempt; only 401/403 fail immediately.
+- Add `max_retries` to cap re-uploads per batch (default unlimited within
+  `doris_upload_timeout`) and log each retry at `Info`.
+- Stop label polling early on definitive non-state replies instead of
+  waiting for `status_poll_timeout`.
+- Offer a lingered batch to workers without blocking. When every worker is
+  busy and the upload queue is full, the batch keeps accumulating in further
+  `linger` windows until it reaches `batch_bytes`, which avoids many small
+  loads under sustained producer pressure.
+- Export `ConfigBuilder`.
 
 ### 0.1.2 - 2026-06-10
 

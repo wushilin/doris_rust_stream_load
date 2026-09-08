@@ -60,6 +60,34 @@ impl StreamLoadError {
     }
 }
 
+/// What the delivery loop should do after a failed stream load attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureAction {
+    /// The request never reached Doris (connection failure). Retry directly.
+    RetryNow,
+    /// Doris may have registered the label. Ask Doris for the label's final
+    /// state before deciding: a visible label is a success, a terminal
+    /// failure (ABORTED / UNKNOWN) is retried with a fresh label.
+    CheckLabel,
+    /// Permanent failure that no retry can fix (authentication / authorization).
+    Fail,
+}
+
+pub(crate) fn failure_action(err: &StreamLoadError) -> FailureAction {
+    match err.status_code() {
+        401 | 403 => FailureAction::Fail,
+        0 if err.retriable() && !err.ambiguous() => FailureAction::RetryNow,
+        _ => FailureAction::CheckLabel,
+    }
+}
+
+/// Whether a failed label-state request is worth repeating: transport
+/// failures and server-side overload are transient, everything else
+/// (configuration errors, 4xx, unparsable definitive replies) is not.
+pub(crate) fn poll_error_is_transient(err: &StreamLoadError) -> bool {
+    err.retriable() || err.ambiguous() || matches!(err.status_code(), 408 | 429 | 500..=599)
+}
+
 pub(crate) trait Sender: Send + Sync {
     fn send(
         &self,
