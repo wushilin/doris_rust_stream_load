@@ -205,7 +205,6 @@ impl HttpSender {
         request = request.header("Expect", "100-continue");
         request = request.header("label", batch.label.clone());
         request = request.header("format", batch.header_format());
-        request = request.header(CONTENT_LENGTH, content_length.to_string());
         if let crate::config::Mode::Json = batch.mode {
             request = request.header("strip_outer_array", "true");
             request = request.header("read_json_by_line", "false");
@@ -214,7 +213,14 @@ impl HttpSender {
             request = request.header("enclose", self.cfg.csv_quote.clone());
         }
         for (key, value) in self.cfg.headers.iter() {
+            if key == CONTENT_LENGTH || key == "compress_type" {
+                continue;
+            }
             request = request.header(key, value.clone());
+        }
+        request = request.header(CONTENT_LENGTH, content_length.to_string());
+        if let Some(compression) = self.cfg.compression.as_header() {
+            request = request.header("compress_type", compression);
         }
         if include_basic_auth {
             if let crate::config::AuthenticationType::Basic = self.cfg.authentication_type {
@@ -259,7 +265,14 @@ impl Sender for HttpSender {
         batch: &DeliveryBatch,
         timeout: Duration,
     ) -> Result<SendOutcome, StreamLoadError> {
-        let body_bytes = batch.encode_body();
+        let body_bytes = crate::compression::encode(&batch.encode_body(), self.cfg.compression)
+            .map_err(|error| StreamLoadError::Error {
+                status_code: 0,
+                message: error.to_string(),
+                retriable: false,
+                ambiguous: false,
+                response: None,
+            })?;
         let mut url = self.cfg.stream_load_url();
         let mut redirect_count = 0;
 

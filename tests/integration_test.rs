@@ -1,4 +1,6 @@
-use doris_rust_stream_load::{AuthenticationType, Client, Config, Mode, ValidationMode};
+use doris_rust_stream_load::{
+    AuthenticationType, Client, Compression, Config, Mode, ValidationMode,
+};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
@@ -29,6 +31,106 @@ fn fake_send_csv_batch_succeeds() {
     assert_eq!(result.status_code, 200);
     assert_eq!(result.response.unwrap().status.unwrap(), "Success");
     client.close().expect("close should succeed");
+}
+
+#[test]
+fn compression_headers_and_content_length_match_transmitted_body() {
+    for (compression, header_value) in [
+        (Compression::None, None),
+        (Compression::Gz, Some("gz")),
+        (Compression::Lzo, Some("lzo")),
+        (Compression::Bz2, Some("bz2")),
+        (Compression::Lz4, Some("lz4")),
+        (Compression::Lzop, Some("lzop")),
+        (Compression::Deflate, Some("deflate")),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let (headers, body) = read_http_request_with_body(&mut stream);
+            write_response(&mut stream, 200, "OK", &[], SUCCESS);
+            (headers, body)
+        });
+
+        let cfg = Config::builder()
+            .stream_load_url(format!("http://{address}/api/db/table/_stream_load"))
+            .with_columns(["id", "name"])
+            .compression(compression)
+            .build()
+            .expect("valid config");
+        let client = Client::new(cfg).expect("client should build");
+        let result = client.send("1,alice".to_string()).unwrap().wait();
+        assert!(result.success(), "{compression:?}: {result:?}");
+        client.close().unwrap();
+
+        let (headers, body) = server.join().unwrap();
+        assert_eq!(
+            header_value_from_request(&headers, "compress_type"),
+            header_value,
+            "{compression:?}"
+        );
+        assert_eq!(
+            header_value_from_request(&headers, "content-length")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap(),
+            body.len(),
+            "{compression:?}"
+        );
+        if compression == Compression::None {
+            assert_eq!(body, b"1,alice");
+        }
+    }
+}
+
+#[test]
+fn json_gzip_compresses_serialized_body_and_sets_stream_load_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind server");
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept request");
+        let (headers, body) = read_http_request_with_body(&mut stream);
+        write_response(&mut stream, 200, "OK", &[], SUCCESS);
+        (headers, body)
+    });
+
+    let cfg = Config::builder()
+        .stream_load_url(format!("http://{address}/api/db/table/_stream_load"))
+        .with_columns(["id", "name"])
+        .mode(Mode::Json)
+        .compression(Compression::Gz)
+        .build()
+        .expect("JSON gzip config should be valid");
+    let client = Client::new(cfg).expect("client should build");
+    let result = client
+        .send(r#"{"id":1,"name":"alice"}"#.to_string())
+        .unwrap()
+        .wait();
+    assert!(result.success(), "{result:?}");
+    client.close().unwrap();
+
+    let (headers, body) = server.join().unwrap();
+    assert_eq!(header_value_from_request(&headers, "format"), Some("json"));
+    assert_eq!(
+        header_value_from_request(&headers, "content-type"),
+        Some("application/json")
+    );
+    assert_eq!(
+        header_value_from_request(&headers, "compress_type"),
+        Some("gz")
+    );
+    assert_eq!(
+        header_value_from_request(&headers, "content-length")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        body.len()
+    );
+    let mut decoder = flate2::read::GzDecoder::new(body.as_slice());
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).unwrap();
+    assert_eq!(decoded, r#"[{"id":1,"name":"alice"}]"#);
 }
 
 #[test]
@@ -471,6 +573,42 @@ fn read_http_request(stream: &mut TcpStream) -> String {
         remaining = remaining.saturating_sub(n);
     }
     headers
+}
+
+fn read_http_request_with_body(stream: &mut TcpStream) -> (String, Vec<u8>) {
+    let mut data = Vec::new();
+    let mut buf = [0; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut buf).expect("read request");
+        assert!(n > 0, "connection closed before request headers");
+        data.extend_from_slice(&buf[..n]);
+        if let Some(pos) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let headers = String::from_utf8_lossy(&data[..header_end]).to_string();
+    let content_length = header_value_from_request(&headers, "content-length")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    while data.len() - header_end < content_length {
+        let n = stream.read(&mut buf).expect("read request body");
+        assert!(n > 0, "connection closed before request body");
+        data.extend_from_slice(&buf[..n]);
+    }
+    (
+        headers,
+        data[header_end..header_end + content_length].to_vec(),
+    )
+}
+
+fn header_value_from_request<'a>(request: &'a str, expected_name: &str) -> Option<&'a str> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case(expected_name)
+            .then_some(value.trim())
+    })
 }
 
 fn write_response(

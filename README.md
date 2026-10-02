@@ -261,6 +261,22 @@ Validation is controlled by `Config::builder().validation(...)`:
 
 CSV formatting defaults to separator `,` and quote `"`. Override with `csv_separator(...)` and `csv_quote(...)`.
 
+CSV and JSON request bodies can be compressed with Doris' `compress_type` option. For example:
+
+```rust
+use doris_rust_stream_load::{Compression, Config};
+
+let cfg = Config::builder()
+    .endpoint("http://doris-fe:8030")
+    .database("events")
+    .table("clicks")
+    .with_columns(["event_time", "user_id", "event_name"])
+    .compression(Compression::Gz)
+    .build()?;
+```
+
+`Compression::None` is the default. Other options are `Gz`, `Lzo`, `Bz2`, `Lz4`, `Lzop`, and `Deflate`. Compression is applied to the complete serialized request body after CSV or JSON serialization.
+
 ## Callback, Handle, Stats
 
 Every accepted send returns a handle. `send(...)` returning `Ok(handle)` means the record entered the SDK queue; it does not mean Doris has accepted the upload yet. Await or block on the handle for the delivery result.
@@ -329,6 +345,7 @@ Required:
 |---|---|
 | `with_columns(iter)` | Doris target columns in record order |
 | `mode(Mode)` | `Mode::Csv` or `Mode::Json`; defaults to `Mode::Csv` |
+| `compression(Compression)` | `Compression::None` by default; Doris Stream Load request body codec selection |
 | `stream_load_url(url)` | Full URL like `http://host:8030/api/db/table/_stream_load` |
 | `endpoint(url)` + `database(db)` + `table(t)` | Alternative to `stream_load_url(url)` |
 
@@ -350,7 +367,7 @@ Batching and queueing:
 | `linger(d)` | `5ms` | Age at which an open batch is offered to a worker; if every worker is busy and the upload queue is full, the batch keeps accumulating in further `linger` windows until it reaches `batch_bytes` |
 | `max_queue_size(n)` | `100000` | Max submitted items in the intake queue |
 | `max_queue_wait_time(d)` | `0` | How long `send` waits for queue space; `0` waits indefinitely |
-| `max_upload_queue_size(n)` | `1` | Channel depth between batcher and upload workers |
+| `max_upload_queue_size(n)` | `max(1, doris_upload_workers)`; with defaults, `4` | Channel depth between batcher and upload workers. An explicitly set value is used as-is. |
 | `doris_upload_workers(n)` | `4` | Concurrent upload workers |
 
 Retry and timing:

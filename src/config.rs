@@ -5,7 +5,6 @@ use std::time::Duration;
 use url::Url;
 
 pub const DEFAULT_MAX_QUEUE_SIZE: usize = 100_000;
-pub const DEFAULT_MAX_UPLOAD_QUEUE_SIZE: usize = 1;
 pub const DEFAULT_BATCH_BYTES: usize = 90 * 1024 * 1024;
 pub const MAX_BATCH_BYTES: usize = 90 * 1024 * 1024;
 pub const DEFAULT_DORIS_UPLOAD_WORKERS: usize = 4;
@@ -26,6 +25,50 @@ pub type Logger = Arc<dyn Fn(LogLevel, &str) + Send + Sync + 'static>;
 pub enum Mode {
     Csv,
     Json,
+}
+
+/// Doris Stream Load request body compression. Values match Doris' `compress_type` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Compression {
+    #[default]
+    None,
+    Gz,
+    Lzo,
+    Bz2,
+    Lz4,
+    Lzop,
+    Deflate,
+}
+
+impl Compression {
+    pub(crate) fn as_header(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Gz => Some("gz"),
+            Self::Lzo => Some("lzo"),
+            Self::Bz2 => Some("bz2"),
+            Self::Lz4 => Some("lz4"),
+            Self::Lzop => Some("lzop"),
+            Self::Deflate => Some("deflate"),
+        }
+    }
+}
+
+impl std::str::FromStr for Compression {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "gz" => Ok(Self::Gz),
+            "lzo" => Ok(Self::Lzo),
+            "bz2" => Ok(Self::Bz2),
+            "lz4" => Ok(Self::Lz4),
+            "lzop" => Ok(Self::Lzop),
+            "deflate" => Ok(Self::Deflate),
+            other => Err(format!("unsupported compression type: {other}")),
+        }
+    }
 }
 
 impl Default for Mode {
@@ -90,6 +133,7 @@ pub struct Config {
     pub columns: Vec<String>,
     pub headers: HeaderMap,
     pub mode: Mode,
+    pub compression: Compression,
     pub authentication_type: AuthenticationType,
     pub authentication_token: Option<String>,
     pub max_queue_size: usize,
@@ -128,10 +172,12 @@ impl Default for Config {
             columns: Vec::new(),
             headers: HeaderMap::new(),
             mode: Mode::default(),
+            compression: Compression::None,
             authentication_type: AuthenticationType::default(),
             authentication_token: None,
             max_queue_size: DEFAULT_MAX_QUEUE_SIZE,
-            max_upload_queue_size: DEFAULT_MAX_UPLOAD_QUEUE_SIZE,
+            // Zero means derive the queue depth from the configured worker count.
+            max_upload_queue_size: 0,
             batch_bytes: DEFAULT_BATCH_BYTES,
             linger: DEFAULT_LINGER,
             max_queue_wait_time: Duration::ZERO,
@@ -201,6 +247,11 @@ impl ConfigBuilder {
 
     pub fn mode(mut self, mode: Mode) -> Self {
         self.config.mode = mode;
+        self
+    }
+
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.config.compression = compression;
         self
     }
 
@@ -337,14 +388,14 @@ impl Config {
         if self.max_queue_size == 0 {
             self.max_queue_size = DEFAULT_MAX_QUEUE_SIZE;
         }
-        if self.max_upload_queue_size == 0 {
-            self.max_upload_queue_size = DEFAULT_MAX_UPLOAD_QUEUE_SIZE;
-        }
         if self.batch_bytes == 0 {
             self.batch_bytes = DEFAULT_BATCH_BYTES;
         }
         if self.doris_upload_workers == 0 {
             self.doris_upload_workers = DEFAULT_DORIS_UPLOAD_WORKERS;
+        }
+        if self.max_upload_queue_size == 0 {
+            self.max_upload_queue_size = self.doris_upload_workers.max(1);
         }
         if self.linger.is_zero() {
             self.linger = DEFAULT_LINGER;
@@ -380,7 +431,6 @@ impl Config {
         if self.columns.is_empty() {
             return Err(Error::InvalidConfig("columns must be configured".into()));
         }
-
         match self.mode {
             Mode::Csv | Mode::Json => {}
         }
@@ -599,4 +649,37 @@ fn validate_stream_load_url(value: &str) -> Result<(), Error> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn compression_values_are_checked_and_json_compression_is_allowed() {
+        assert_eq!(Compression::from_str("gz").unwrap(), Compression::Gz);
+        assert!(Compression::from_str("gzip").is_err());
+
+        let config = Config::builder()
+            .endpoint("http://localhost:8030")
+            .database("db")
+            .table("tbl")
+            .with_columns(["id"])
+            .mode(Mode::Json)
+            .compression(Compression::Gz)
+            .build()
+            .expect("JSON compression should be allowed");
+        assert_eq!(config.compression, Compression::Gz);
+    }
+
+    #[test]
+    fn upload_queue_defaults_to_worker_count_unless_explicitly_set() {
+        let mut config = Config::default();
+        config.doris_upload_workers = 6;
+        assert_eq!(config.clone().with_defaults().max_upload_queue_size, 6);
+
+        config.max_upload_queue_size = 2;
+        assert_eq!(config.with_defaults().max_upload_queue_size, 2);
+    }
 }
